@@ -2,11 +2,18 @@
 
 ## Overview
 
-[Dokploy](https://dokploy.com) is an open-source self-hosted PaaS that deploys Docker Compose
-applications on any VPS.  It uses **Traefik** for reverse-proxy / TLS termination and a
-simple web dashboard for configuration.
+[Dokploy](https://dokploy.com) is a **free, open-source** self-hosted PaaS that runs on any
+Linux machine you already own — a spare PC, a home server, or any hardware you control.
+It uses **Traefik** for reverse-proxy / TLS termination and a simple web dashboard for
+configuration.  There are **zero cloud fees** because everything runs on your own hardware.
 
-This guide covers deploying NeonDB to a Dokploy-managed VPS.
+NeonDB is also **built from source** via Dokploy's Git integration — no registry account,
+no image hosting fees, no paid services of any kind.
+
+This guide covers deploying NeonDB on your self-hosted Dokploy instance.
+
+> **Cost**: $0.  Dokploy is MIT-licensed.  NeonDB is built from your own source repo.
+> The only cost is your own electricity and hardware.
 
 ---
 
@@ -14,18 +21,21 @@ This guide covers deploying NeonDB to a Dokploy-managed VPS.
 
 | Item | Requirement |
 |---|---|
-| VPS | Any Linux x86_64 with ≥ 1 GB RAM (2 GB recommended) |
-| Docker | Installed via the Dokploy installer |
-| Dokploy | Installed at `http://<vps-ip>:3000` |
-| Domain (optional) | For TLS — point an A record at your VPS IP |
+| Machine | Any Linux x86_64 — spare PC, home server, mini PC, etc. |
+| RAM | ≥ 1 GB (2 GB recommended for comfortable operation) |
+| Docker | Installed automatically by the Dokploy installer |
+| Domain (optional) | For TLS — point an A record at your machine's public IP |
 
-### Install Dokploy on your VPS
+> **No cloud account required.** Dokploy and NeonDB both run entirely on hardware you own.
+
+### Install Dokploy on your machine
 
 ```bash
+# Run once on your Linux machine (installs Docker + Dokploy automatically)
 curl -sSL https://dokploy.com/install.sh | sh
 ```
 
-Access the dashboard at `http://<your-vps-ip>:3000` and create your admin account.
+Access the dashboard at `http://<your-machine-ip>:3000` and create your admin account.
 
 ---
 

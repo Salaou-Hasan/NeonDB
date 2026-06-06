@@ -1,1 +1,0 @@
-Use `neondb build --module ./modules/sample` to compile the sample WASM module.
