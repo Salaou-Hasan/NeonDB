@@ -235,14 +235,121 @@ Added `row_locks: DashMap<String, Arc<Mutex<()>>>` to each `Table`. `apply_delta
 
 **Files changed**: `src/main.rs`
 
+### Session 9 — TODO-006 Snapshots implemented
+
+**TODO-006: Snapshot subsystem (src/wal/snapshot.rs, src/table/mod.rs, src/config.rs, src/main.rs)**
+
+Implemented atomic WAL-scale snapshots to bound startup replay time:
+
+- **`src/wal/snapshot.rs`** — new file. `SnapshotMeta` header struct (`version`, `last_sequence`, `timestamp`, `row_count`, `next_row_id`). `save_snapshot()` serialises all `TableStore` rows to MessagePack and writes atomically via `.tmp` → fsync → rename. `load_snapshot()` bulk-restores rows and resets `next_row_id`. `find_latest_snapshot()` scans a directory for `neondb_snapshot_*.bin` files and returns the highest sequence. 4 new unit tests.
+- **`src/table/mod.rs`** — added 4 public helper methods: `list_tables()`, `list_rows_with_keys()`, `current_next_row_id()`, `set_next_row_id()`.
+- **`src/config.rs`** — added `snapshot_interval: u64` (default 1 000 000) and `snapshot_dir: PathBuf` (default `temp_dir/neondb_snapshots`). Wired into `ConfigServer` TOML fields and `NEONDB_SNAPSHOT_INTERVAL` / `NEONDB_SNAPSHOT_DIR` env vars.
+- **`src/main.rs`** — startup now: (1) loads the latest snapshot from `snapshot_dir` if one exists, (2) replays only WAL entries with `sequence_number > snapshot.last_sequence`, (3) initialises `global_seq` to `max_replayed_seq + 1` (fixes a latent duplicate-seq bug present since session 1). Worker loop triggers a `tokio::task::spawn_blocking` snapshot task every `snapshot_interval` committed transactions. `recover_from_wal` now takes `min_seq: u64` and returns `(usize, u64)`.
+
+### Session 10 — TODO-007 Auth / Identity implemented
+
+**TODO-007: Auth & per-reducer caller identity**
+
+- **`src/reducer/context.rs`** — added `pub caller_id: String` field to `ReducerContext`, default `String::new()`. Worker loop sets it from `PendingCall.caller_id` after construction. Reducers can read `ctx.caller_id` to identify the calling client.
+- **`src/network/websocket.rs`** — added `pub caller_id: String` to `PendingCall`. During WebSocket handshake, `handle_client` extracts the `X-NeonDB-Identity` HTTP header value; falls back to TCP peer address if the header is absent. Threaded through both `PendingCall` construction sites (primary `ReducerCall` arm and legacy fallback decoder).
+- **`src/main.rs`** — worker loop captures `call.caller_id` before the `spawn_blocking` closure and sets `ctx.caller_id` inside the blocking context.
+- **`tests/integration.rs`** — added `spawn_server_with_env()` helper, `bearer_request()` helper (uses `IntoClientRequest` + header mutation for correct WebSocket upgrade headers), and two new integration tests: `integration_api_key_rejects_unauthorized` (verifies no-key and wrong-key connections are rejected; correct key succeeds) and `integration_no_api_key_accepts_all` (verifies open access when no `NEONDB_API_KEY` is set).
+
+**API key auth** (already in place via `NEONDB_API_KEY` env var / `api_key` config field) is enforced at the WebSocket upgrade handshake via `Authorization: Bearer <key>` header.
+
+**Per-connection identity** is derived from `X-NeonDB-Identity` header on the upgrade request, falling back to the TCP peer address string (`"ip:port"`). The value is available to all reducer backends as `ctx.caller_id`.
+
+### Session 11 — TODO-004 Subscription Query Engine
+
+**TODO-004: IN operator + AND compound predicates (src/subscriptions.rs)**
+
+- **`Predicate`** changed from a flat struct to an enum with three variants:
+  - `Predicate::Comparison { field, op, value }` — existing single-field comparisons
+  - `Predicate::In { field, values }` — new: `WHERE status IN ('active', 'pending')`
+  - `Predicate::And(Box<Predicate>, Box<Predicate>)` — new: `WHERE score > 100 AND level > 5`
+- **`ComparisonOp::compare(actual, expected)`** — new method that encapsulates the comparison logic (moved out of the old `Predicate::matches`).
+- **`Predicate::eval(delta)`** — replaces the old `matches(actual: Option<&Value>)`. Each variant evaluates recursively against the full `RowDelta`, enabling multi-field compound predicates.
+- **`SubscriptionFilter::matches`** — simplified to call `predicate.eval(delta)`.
+- **`subscribe_with_snapshot`** — switched from `list_rows` to `list_rows_with_keys`; builds a synthetic `RowDelta` per row so `filter.matches()` handles all variants uniformly.
+- **Parser** — `parse_predicate` rewritten as a 3-step recursive descent: (1) paren-depth-aware `AND` split, (2) `IN (...)` detection, (3) fall back to `parse_comparison`.
+- 6 new unit tests covering: `IN` strings, `IN` numbers, `AND` short-circuit, combined `IN AND comparison`, and two parse-shape tests.
+
+### Session 12 — TODO-009 Secondary Indexes implemented
+
+**TODO-009: B-tree + Hash Indexes on Tables (src/table/mod.rs)**
+
+- **`FieldIndex` struct** — two-level concurrent set: `field_value_as_string → DashMap<row_key, ()>`. All DashMap operations are lock-free; reads add zero contention.
+- **`Table.field_indexes`** — `DashMap<String, Arc<FieldIndex>>` per table; indexed fields are registered at runtime via `create_index()`.
+- **`TableStore::create_index(table, field)`** — idempotent; back-fills existing rows immediately on registration.
+- **`TableStore::drop_index(table, field)`** — removes the index; no-op if absent.
+- **`TableStore::index_lookup(table, field, value) -> Option<Vec<String>>`** — returns `None` if no index (caller falls back to scan), or `Some(row_keys)` for O(1) equality lookup.
+- **`TableStore::list_indexes(table)`** — list registered indexed fields.
+- **Automatic maintenance** — `write_row_unlocked` and `delete_row_unlocked` update all registered indexes on every write/delete; old-value removal + new-value insertion are handled atomically within the row lock window.
+- 5 new unit tests: basic lookup, no-index returns None, update maintenance, delete maintenance, back-fill on create.
+
+### Session 13 — TODO-008 Scheduled Reducers implemented
+
+**TODO-008: Scheduled Reducers (src/config.rs, src/main.rs)**
+
+- **`src/config.rs`** — new `ScheduledReducerConfig { reducer, interval_ms, args_json }` struct. Added `scheduled_reducers: Vec<ScheduledReducerConfig>` to `Config` (default empty). Added `[[scheduler]]` TOML table-array schema (`ConfigScheduler`) and `apply_scheduler_section()` helper.
+- **`src/main.rs`** — after worker handles are spawned, one async task is created per `[[scheduler]]` entry. Each task:
+  - Skips the first tick (so the first real fire happens one full interval after startup)
+  - Uses `tokio::time::MissedTickBehavior::Skip` to avoid burst catch-up
+  - Encodes `args_json` (if present) to MessagePack before dispatch
+  - Enqueues a `PendingCall` with `caller_id = "scheduler"` into the worker queue
+  - Awaits the response in a detached inner task and logs failures at WARN level
+  - Exits cleanly on shutdown signal
+  - Scheduler call IDs use a separate namespace (`u64::MAX / 2` base) to avoid collisions with client call IDs
+- Scheduler handles join during graceful shutdown (after workers drain, before WAL close)
+
+Example `neondb.toml` usage:
+```toml
+[[scheduler]]
+reducer = "cleanup_expired"
+interval_ms = 60000
+
+[[scheduler]]
+reducer = "leaderboard_refresh"
+interval_ms = 300000
+args_json = "{\"top_n\": 100}"
+```
+
+### Session 14 — TODO-015 Standalone Benchmarking Tool
+
+**TODO-015: `neondb-bench` binary (src/bin/neondb_bench.rs, Cargo.toml)**
+
+- **`src/bin/neondb_bench.rs`** — new standalone binary that connects N concurrent WebSocket clients to a running NeonDB server, sends M reducer calls each, records per-call round-trip latencies using an HDR histogram, and prints a Markdown report. CLI flags: `--url`, `--clients`, `--calls`, `--warmup`, `--reducer`, `--counter`, `--delta`, `--api-key`, `--output`, `--timeout-ms`.
+- **`Cargo.toml`** — moved `hdrhistogram = "7.5"` from `[dev-dependencies]` to `[dependencies]` (required for the binary target); added `[[bin]] name = "neondb-bench"` entry.
+- Output includes: configuration table, total time, TPS, success count, failure count, success rate, and latency percentiles (p50, p75, p90, p95, p99, p99.9, max).
+
+Usage:
+```
+cargo run --release --bin neondb-bench -- --clients 20 --calls 1000 --output report.md
+```
+
+---
+
+### Session 15 — Deployment: Coolify → Dokploy migration
+
+**Deployment platform changed from Coolify to Dokploy.**
+
+- **`COOLIFY_DEPLOYMENT.md`** — deleted.
+- **`DOKPLOY_DEPLOYMENT.md`** — new comprehensive Dokploy deployment guide. Covers: Option A (Git-connected build via Dokploy dashboard), Option B (Docker Compose with Traefik labels), environment variables (including new snapshot/auth vars), volume mounts, domain + auto-TLS via Traefik, performance tuning profiles, sharded multi-node topology, monitoring, troubleshooting, and security.
+- **`SELF_HOSTED_SETUP.md`** — rewritten for Dokploy (replaces old Coolify/WSL2 guide).
+- **`DEPLOYMENT.md`** — Coolify section replaced with Dokploy section; new `### Snapshot Configuration` env var docs added.
+- **`PRODUCTION_READY.md`** — all Coolify references updated to Dokploy; test count updated to 79.
+- **`PHASE_0_PLANNING.md`** — Coolify → Dokploy throughout.
+- **`Dockerfile`** — pinned to `rust:1.78-slim`; added build deps (`pkg-config`, `libssl-dev`); copies `modules/` into runtime image; creates `/data/snapshots`; adds `NEONDB_SNAPSHOT_INTERVAL` and `NEONDB_SNAPSHOT_DIR` env vars; bumps `NEONDB_MAX_CONNECTIONS` to 200.
+- **`docker-compose.yml`** — split `neondb-data` into `neondb-wal` + `neondb-snapshots` volumes; adds snapshot env vars; adds commented-out Traefik labels for Dokploy Option B.
+
 ---
 
 ## Current Build Status
 
-After Session 8:
-- `cargo test` → **51 tests, all pass** (48 from Session 6 + 3 new TODO-003 snapshot tests).
+After Session 15:
+- `cargo test` → **79 tests, all pass** (73 unit + 6 integration).
 - `cargo build --release` → zero errors, zero warnings.
-- `cargo bench` → run to establish updated baselines.
+- `cargo build --bin neondb-bench` → standalone benchmark binary builds cleanly.
 
 ---
 

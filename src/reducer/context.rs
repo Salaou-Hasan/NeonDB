@@ -40,6 +40,7 @@ pub struct SubscriptionDiff {
 pub struct ReducerContext {
     pub tables: Arc<TableStore>,
     pub timestamp: u64,
+    pub caller_id: String,
     pending_deltas: Vec<RowDelta>,
     pub pending_diffs: Vec<SubscriptionDiff>,
 }
@@ -49,6 +50,7 @@ impl ReducerContext {
         ReducerContext {
             tables,
             timestamp,
+            caller_id: String::new(),
             pending_deltas: Vec::with_capacity(4),
             pending_diffs: Vec::with_capacity(4),
         }
@@ -88,7 +90,12 @@ impl ReducerContext {
         row_value: Value,
     ) -> Result<RowDelta> {
         let existing = self.get_row(&table_name, &row_key)?;
-        let operation = if existing.is_some() { "update" } else { "insert" }.to_string();
+        let operation = if existing.is_some() {
+            "update"
+        } else {
+            "insert"
+        }
+        .to_string();
 
         let encoded = serde_json::to_vec(&row_value)
             .map_err(|e| NeonDBError::SerializationError(format!("Row encode: {}", e)))?;
@@ -133,10 +140,12 @@ impl ReducerContext {
         for delta in &self.pending_deltas {
             if delta.table_name == "counters" && delta.row_key == name {
                 match delta.operation.as_str() {
-                    "delete" => { base = None; }
+                    "delete" => {
+                        base = None;
+                    }
                     "counter_add" => {
                         let cur = base.as_ref().map(|c| c.value).unwrap_or(0);
-                        let id  = base.as_ref().map(|c| c.id).unwrap_or(0);
+                        let id = base.as_ref().map(|c| c.id).unwrap_or(0);
                         base = Some(Counter {
                             id,
                             name: name.to_string(),
@@ -171,7 +180,7 @@ impl ReducerContext {
             row_id: 0,
             shard_id: self.tables.shard_id(),
             payload_arc: None,
-            row_data: None,           // filled in by apply_delta_batch
+            row_data: None, // filled in by apply_delta_batch
             counter_add_amount: amount,
             counter_add_timestamp: self.timestamp as i64,
         };
@@ -189,7 +198,11 @@ impl ReducerContext {
         row_key: String,
         payload: Arc<Bytes>,
     ) -> Result<()> {
-        self.pending_diffs.push(SubscriptionDiff { table_name, row_key, payload });
+        self.pending_diffs.push(SubscriptionDiff {
+            table_name,
+            row_key,
+            payload,
+        });
         Ok(())
     }
 
@@ -322,11 +335,24 @@ mod tests {
         tables.set_counter("pts".to_string(), 10, 0).unwrap();
 
         let mut c = ReducerContext::new(tables.clone(), 0);
-        increment_reducer(&mut c, "pts".to_string(), 5).unwrap();  // pending: +5 → provisional 15
+        increment_reducer(&mut c, "pts".to_string(), 5).unwrap(); // pending: +5 → provisional 15
         let (r, _) = increment_reducer(&mut c, "pts".to_string(), 3).unwrap(); // +3 → provisional 18
         assert_eq!(r.new_value, 18);
 
         c.commit().unwrap();
         assert_eq!(tables.get_counter("pts").unwrap().unwrap().value, 18);
+    }
+
+    #[test]
+    fn test_caller_id_default_is_empty() {
+        let c = ctx();
+        assert_eq!(c.caller_id, "");
+    }
+
+    #[test]
+    fn test_caller_id_can_be_set() {
+        let mut c = ctx();
+        c.caller_id = "player-42".to_string();
+        assert_eq!(c.caller_id, "player-42");
     }
 }

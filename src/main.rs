@@ -21,23 +21,27 @@ use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{atomic::AtomicUsize, Arc};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
 use hyper::{
     service::{make_service_fn, service_fn},
     Body, Method, Request, Response, Server, StatusCode,
 };
-use tokio::sync::watch;
 use neondb::{
-    config::Config,
+    config::{Config, ScheduledReducerConfig},
     error::Result,
     network::{start_listener, PendingCall, ReducerResponse},
     reducer::{ReducerContext, ReducerRegistry},
     subscriptions::SubscriptionManager,
     table::TableStore,
-    wal::{WalEntry, WalReader, BatchedWalWriter},
+    wal::{
+        snapshot::{find_latest_snapshot, load_snapshot, save_snapshot},
+        BatchedWalWriter, WalEntry, WalReader,
+    },
 };
+use rmp_serde;
+use tokio::sync::watch;
 
 #[derive(Parser, Debug)]
 #[command(name = "neondb")]
@@ -89,11 +93,21 @@ async fn main() -> Result<()> {
             fsync_interval_ms,
         } => {
             let mut config = Config::from_env();
-            if let Some(h) = host        { config.host = h; }
-            if let Some(p) = port        { config.port = p; }
-            if let Some(d) = data_dir    { config.wal_path = d.join("neondb.wal"); }
-            if let Some(w) = wal_path    { config.wal_path = w; }
-            if let Some(f) = fsync_interval_ms { config.fsync_interval_ms = f; }
+            if let Some(h) = host {
+                config.host = h;
+            }
+            if let Some(p) = port {
+                config.port = p;
+            }
+            if let Some(d) = data_dir {
+                config.wal_path = d.join("neondb.wal");
+            }
+            if let Some(w) = wal_path {
+                config.wal_path = w;
+            }
+            if let Some(f) = fsync_interval_ms {
+                config.fsync_interval_ms = f;
+            }
             run_server(config).await
         }
     }
@@ -139,11 +153,42 @@ async fn run_server(config: Config) -> Result<()> {
         registry.list_reducers()
     );
 
-    // ── WAL recovery ──────────────────────────────────────────────────────────
+    // ── Snapshot + WAL recovery ─────────────────────────────────────────────
+    //
+    // Recovery order:
+    //   1. Find the most-recent snapshot file in snapshot_dir.
+    //   2. If found, load it (restores all rows + next_row_id) and record
+    //      last_sequence so we can skip WAL entries already covered.
+    //   3. Replay only WAL entries with sequence_number > snapshot.last_sequence.
+    //   4. Initialise global_seq to (max_replayed_seq + 1) to prevent
+    //      duplicate sequence numbers across restarts.
+    let mut min_wal_seq: u64 = 0;
+    let mut initial_seq: u64 = 0;
+
+    let snap_dir = config.snapshot_dir.clone();
+    if let Some((snap_path, snap_seq)) = find_latest_snapshot(&snap_dir) {
+        log::info!("Loading snapshot: {:?} (seq {})", snap_path, snap_seq);
+        match load_snapshot(&snap_path, &tables) {
+            Ok(meta) => {
+                min_wal_seq = meta.last_sequence;
+                initial_seq = meta.last_sequence.saturating_add(1);
+                log::info!(
+                    "Snapshot loaded: {} rows, replaying WAL from seq > {}",
+                    meta.row_count,
+                    meta.last_sequence
+                );
+            }
+            Err(e) => log::warn!("Failed to load snapshot: {} — replaying full WAL", e),
+        }
+    }
+
     log::info!("Recovering from WAL: {:?}", config.wal_path);
     if config.wal_path.exists() {
-        match recover_from_wal(&config.wal_path, &tables) {
-            Ok(n)  => log::info!("Recovered {} entries from WAL", n),
+        match recover_from_wal(&config.wal_path, &tables, min_wal_seq) {
+            Ok((n, max_seq)) => {
+                log::info!("Recovered {} entries from WAL (last seq={})", n, max_seq);
+                initial_seq = initial_seq.max(max_seq.saturating_add(1));
+            }
             Err(e) => log::warn!("Failed to recover from WAL: {}", e),
         }
     } else {
@@ -163,11 +208,11 @@ async fn run_server(config: Config) -> Result<()> {
     // NOTE: tables is passed so the subscribe handler can deliver
     // initial_snapshot frames for all existing matching rows (TODO-003).
     let listener_handle = {
-        let config_c    = config.clone();
-        let tx_c        = reducer_tx.clone();
-        let subs_c      = subscription_manager.clone();
-        let tables_c    = tables.clone();          // <── TODO-003 fix
-        let conns_c     = active_connections.clone();
+        let config_c = config.clone();
+        let tx_c = reducer_tx.clone();
+        let subs_c = subscription_manager.clone();
+        let tables_c = tables.clone(); // <── TODO-003 fix
+        let conns_c = active_connections.clone();
         let rx_shutdown = shutdown_rx.clone();
         tokio::spawn(async move {
             if let Err(e) = start_listener(
@@ -175,7 +220,7 @@ async fn run_server(config: Config) -> Result<()> {
                 config_c.port,
                 tx_c,
                 subs_c,
-                tables_c,                          // <── TODO-003 fix
+                tables_c, // <── TODO-003 fix
                 config_c.max_connections,
                 config_c.api_key.clone(),
                 conns_c,
@@ -190,10 +235,10 @@ async fn run_server(config: Config) -> Result<()> {
 
     // ── Metrics server ────────────────────────────────────────────────────────
     let metrics_handle = {
-        let subs_c      = subscription_manager.clone();
+        let subs_c = subscription_manager.clone();
         let rx_shutdown = shutdown_rx.clone();
-        let host_c      = config.host.clone();
-        let mport       = config.metrics_port;
+        let host_c = config.host.clone();
+        let mport = config.metrics_port;
         tokio::spawn(async move {
             if let Err(e) = start_metrics_server(host_c, mport, subs_c, rx_shutdown).await {
                 log::error!("Metrics server error: {}", e);
@@ -216,33 +261,39 @@ async fn run_server(config: Config) -> Result<()> {
     let worker_count = num_cpus::get().max(1);
     log::info!("Starting {} parallel reducer workers", worker_count);
 
-    let timeout_ms  = config.reducer_timeout_ms;
-    // Shared monotonic sequence number across workers for WAL ordering.
-    let global_seq  = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let timeout_ms = config.reducer_timeout_ms;
+    let snapshot_interval = config.snapshot_interval;
+    let snapshot_dir_w = config.snapshot_dir.clone();
+    // global_seq starts after the last replayed WAL entry so new entries
+    // never duplicate sequence numbers from a previous run.
+    let global_seq = Arc::new(std::sync::atomic::AtomicU64::new(initial_seq));
 
     let mut worker_handles = Vec::with_capacity(worker_count);
     for worker_id in 0..worker_count {
-        let rx         = reducer_rx.clone();
-        let tables_w   = tables.clone();
+        let rx = reducer_rx.clone();
+        let tables_w = tables.clone();
         let registry_w = registry.clone();
-        let subs_w     = subscription_manager.clone();
-        let wal_w      = wal_writer.clone();
-        let seq_w      = global_seq.clone();
+        let subs_w = subscription_manager.clone();
+        let wal_w = wal_writer.clone();
+        let seq_w = global_seq.clone();
+        let snap_interval_w = snapshot_interval;
+        let snap_dir_ww = snapshot_dir_w.clone();
 
         let handle = tokio::spawn(async move {
             log::debug!("Reducer worker {} started", worker_id);
             loop {
                 let call = match rx.recv().await {
-                    Ok(c)  => c,
+                    Ok(c) => c,
                     Err(_) => break, // channel closed — graceful shutdown
                 };
 
-                let call_id    = call.call_id;
+                let call_id = call.call_id;
                 let tables_blk = tables_w.clone();
                 let registry_blk = registry_w.clone();
                 let reducer_name = call.reducer_name.clone();
-                let args         = call.args.clone();
-                let timestamp    = current_timestamp_nanos();
+                let args = call.args.clone();
+                let timestamp = current_timestamp_nanos();
+                let call_caller_id = call.caller_id.clone();
 
                 // Run the (potentially CPU-heavy) reducer on the blocking thread
                 // pool so it doesn't starve the Tokio async runtime.
@@ -250,11 +301,10 @@ async fn run_server(config: Config) -> Result<()> {
                     std::time::Duration::from_millis(timeout_ms),
                     tokio::task::spawn_blocking(move || {
                         let mut ctx = ReducerContext::new(tables_blk, timestamp);
-                        let exec = std::panic::catch_unwind(
-                            std::panic::AssertUnwindSafe(|| {
-                                registry_blk.execute(&reducer_name, &mut ctx, &args)
-                            }),
-                        );
+                        ctx.caller_id = call_caller_id.clone();
+                        let exec = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            registry_blk.execute(&reducer_name, &mut ctx, &args)
+                        }));
                         (exec, ctx)
                     }),
                 )
@@ -272,10 +322,8 @@ async fn run_server(config: Config) -> Result<()> {
                     Ok(Ok((exec_result, mut ctx))) => match exec_result {
                         Ok(Ok(result_bytes)) => match ctx.commit() {
                             Ok(deltas) => {
-                                let seq_num = seq_w.fetch_add(
-                                    1,
-                                    std::sync::atomic::Ordering::Relaxed,
-                                );
+                                let seq_num =
+                                    seq_w.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 let entry = WalEntry::new(
                                     timestamp,
                                     seq_num,
@@ -290,6 +338,48 @@ async fn run_server(config: Config) -> Result<()> {
                                     }
                                     Ok(_) => {
                                         subs_w.publish_deltas(&deltas);
+
+                                        // Trigger a background snapshot every
+                                        // `snapshot_interval` committed transactions.
+                                        // fetch_add returns the PREVIOUS value, so
+                                        // seq_num=0,1,...  The snapshot fires when
+                                        // (seq_num + 1) is a multiple of the interval.
+                                        if snap_interval_w > 0
+                                            && (seq_num + 1) % snap_interval_w == 0
+                                        {
+                                            let tables_snap = tables_w.clone();
+                                            let dir_snap = snap_dir_ww.clone();
+                                            let ts_snap = current_timestamp_nanos();
+                                            tokio::spawn(async move {
+                                                let result =
+                                                    tokio::task::spawn_blocking(move || {
+                                                        save_snapshot(
+                                                            &tables_snap,
+                                                            &dir_snap,
+                                                            seq_num,
+                                                            ts_snap,
+                                                        )
+                                                    })
+                                                    .await;
+                                                match result {
+                                                    Ok(Ok(())) => log::info!(
+                                                        "Background snapshot written at seq {}",
+                                                        seq_num
+                                                    ),
+                                                    Ok(Err(e)) => log::error!(
+                                                        "Snapshot failed at seq {}: {}",
+                                                        seq_num,
+                                                        e
+                                                    ),
+                                                    Err(e) => log::error!(
+                                                        "Snapshot task panicked at seq {}: {}",
+                                                        seq_num,
+                                                        e
+                                                    ),
+                                                }
+                                            });
+                                        }
+
                                         ReducerResponse::success(call_id, result_bytes)
                                     }
                                 }
@@ -319,13 +409,95 @@ async fn run_server(config: Config) -> Result<()> {
         worker_handles.push(handle);
     }
 
-    // ── Wait for Ctrl-C ───────────────────────────────────────────────────────
+    // ── Scheduled reducer tasks ─────────────────────────────────────────
+    // One lightweight async task per [[scheduler]] entry.  Each task ticks at
+    // `interval_ms`, enqueues a PendingCall into the worker pool, and waits for
+    // the result in a fire-and-forget inner task.  Shuts down when the watcher
+    // fires so all scheduled reducers drain gracefully.
+    let mut scheduler_handles = Vec::new();
+    let sched_seq = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX / 2));
+
+    for sched in &config.scheduled_reducers {
+        let sched: ScheduledReducerConfig = sched.clone();
+        let tx_sched = reducer_tx.clone();
+        let seq_sched = sched_seq.clone();
+        let mut rx_shutdown_sched = shutdown_rx.clone();
+
+        // Pre-encode args: JSON string → MessagePack bytes.
+        // Falls back to empty bytes if args_json is absent or unparseable.
+        let args_bytes: Vec<u8> = sched
+            .args_json
+            .as_deref()
+            .and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok())
+            .and_then(|v| rmp_serde::to_vec(&v).ok())
+            .unwrap_or_default();
+
+        log::info!(
+            "Scheduler: '{}' every {}ms",
+            sched.reducer,
+            sched.interval_ms
+        );
+
+        let handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_millis(sched.interval_ms.max(1)));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // First tick fires immediately — skip it so the first real fire
+            // happens one full interval after startup.
+            ticker.tick().await;
+
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        let call_id = seq_sched.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let (resp_tx, mut resp_rx) = tokio::sync::mpsc::unbounded_channel::<ReducerResponse>();
+                        let call = PendingCall {
+                            call_id,
+                            reducer_name: sched.reducer.clone(),
+                            args: args_bytes.clone(),
+                            caller_id: "scheduler".to_string(),
+                            response_tx: resp_tx,
+                        };
+                        if tx_sched.send(call).await.is_ok() {
+                            // Await the result in a detached task so we don't block the tick.
+                            let name_c = sched.reducer.clone();
+                            tokio::spawn(async move {
+                                if let Some(resp) = resp_rx.recv().await {
+                                    if !resp.success {
+                                        log::warn!(
+                                            "Scheduled reducer '{}' (call_id={}) failed: {:?}",
+                                            name_c, call_id, resp.error
+                                        );
+                                    } else {
+                                        log::debug!("Scheduled reducer '{}' (call_id={}) ok", name_c, call_id);
+                                    }
+                                }
+                            });
+                        } else {
+                            // Channel closed — workers are shutting down.
+                            break;
+                        }
+                    }
+                    _ = rx_shutdown_sched.changed() => break,
+                }
+            }
+            log::debug!("Scheduler for '{}' stopped", sched.reducer);
+        });
+        scheduler_handles.push(handle);
+    }
+
+    // ── Wait for Ctrl-C ────────────────────────────────────────────────
     tokio::signal::ctrl_c().await.ok();
     log::info!("Shutdown signal received");
+
+    // Broadcast shutdown so schedulers and the listener stop accepting work.
+    let _ = shutdown_tx.send(());
 
     // Drop the sender so all workers drain remaining calls then exit.
     drop(reducer_tx);
     for h in worker_handles {
+        let _ = h.await;
+    }
+    for h in scheduler_handles {
         let _ = h.await;
     }
 
@@ -336,7 +508,6 @@ async fn run_server(config: Config) -> Result<()> {
         }
     }
 
-    let _ = shutdown_tx.send(());
     let _ = listener_handle.await;
     let _ = metrics_handle.await;
     log::info!("Shutdown complete");
@@ -369,7 +540,9 @@ async fn start_metrics_server(
     log::info!("Metrics endpoint available on http://{}", addr);
 
     server
-        .with_graceful_shutdown(async move { let _ = shutdown.changed().await; })
+        .with_graceful_shutdown(async move {
+            let _ = shutdown.changed().await;
+        })
         .await
         .map_err(|e| {
             neondb::error::NeonDBError::network_error(format!("Metrics server error: {}", e))
@@ -408,10 +581,32 @@ fn current_timestamp_nanos() -> u64 {
         .unwrap_or(0)
 }
 
-fn recover_from_wal(wal_path: &Path, tables: &Arc<TableStore>) -> Result<usize> {
+/// Replay WAL entries from `wal_path` into `tables`.
+///
+/// Entries whose `sequence_number <= min_seq` are skipped — they are already
+/// captured in the snapshot that was loaded before this call.
+///
+/// Returns `(replayed_count, max_sequence_number_seen)`.  The caller should
+/// initialise `global_seq` to `max_seq + 1` to prevent duplicate sequence
+/// numbers across restarts.
+fn recover_from_wal(
+    wal_path: &Path,
+    tables: &Arc<TableStore>,
+    min_seq: u64,
+) -> Result<(usize, u64)> {
     let mut reader = WalReader::open(wal_path)?;
-    let entries    = reader.read_all_entries()?;
+    let entries = reader.read_all_entries()?;
+    let mut replayed = 0usize;
+    let mut max_seq = min_seq;
     for entry in &entries {
+        // Track the highest sequence number regardless of whether we replay.
+        max_seq = max_seq.max(entry.header.sequence_number);
+
+        // Skip entries already covered by the loaded snapshot.
+        if entry.header.sequence_number <= min_seq {
+            continue;
+        }
+
         if !entry.verify_checksum() {
             log::warn!(
                 "WAL entry {} has invalid checksum, skipping",
@@ -422,6 +617,7 @@ fn recover_from_wal(wal_path: &Path, tables: &Arc<TableStore>) -> Result<usize> 
         for delta in &entry.payload.deltas {
             tables.apply_delta(delta)?;
         }
+        replayed += 1;
     }
-    Ok(entries.len())
+    Ok((replayed, max_seq))
 }

@@ -32,6 +32,7 @@ bytes = "1.5"                            # Arc<Bytes> for zero-copy sub fan-out
 crossbeam = "0.8"                        # crossbeam utilities
 crossbeam-channel = "0.5"               # used in WAL batch writer
 num_cpus = "1.16"                        # parallel reducer workers
+hdrhistogram = "7.5"                     # latency percentile tracking (bench + end_to_end)
 arc-swap = "1.6"                         # atomic Arc swaps for hot config
 flume = "0.11"                           # backup MPSC channel
 
@@ -46,7 +47,11 @@ wat = "1.0"
 [dev-dependencies]
 tokio-test = "0.4"
 criterion = "0.5"
-hdrhistogram = "7.5"
+
+# ── Standalone benchmark binary ──────────────────────────────────────────────
+[[bin]]
+name = "neondb-bench"
+path = "src/bin/neondb_bench.rs"
 
 # ── Existing benchmarks ───────────────────────────────────────────────────────
 [[bench]]

@@ -1,6 +1,6 @@
 use crate::error::Result;
 use crate::reducer::backend::ReducerBackend;
-use crate::reducer::context::{IncrementResult, ReducerContext};
+use crate::reducer::context::ReducerContext;
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize)]
@@ -43,6 +43,7 @@ impl ReducerBackend for NativeReducerBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reducer::context::IncrementResult;
     use crate::table::TableStore;
     use std::sync::Arc;
 

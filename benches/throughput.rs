@@ -22,6 +22,7 @@
 //   racing_tick        : 12 subs, 3 writes/call (racing position broadcast)
 // ============================================================================
 
+use bytes::Bytes;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use neondb::{
     reducer::{increment_reducer, ReducerContext},
@@ -29,7 +30,6 @@ use neondb::{
     table::{RowDelta, TableStore},
 };
 use std::sync::Arc;
-use bytes::Bytes;
 use tokio::sync::mpsc;
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
@@ -43,6 +43,8 @@ fn make_delta(table: &str, key: &str, v: i64) -> RowDelta {
         shard_id: 0,
         payload_arc: None,
         row_data: Some(serde_json::json!({"value": v})),
+        counter_add_amount: 0,
+        counter_add_timestamp: 0,
     }
 }
 
@@ -51,13 +53,17 @@ fn make_delta(table: &str, key: &str, v: i64) -> RowDelta {
 fn build_sub_manager(
     n: usize,
     table: &str,
-) -> (Arc<SubscriptionManager>, Vec<mpsc::UnboundedReceiver<Arc<Bytes>>>) {
+) -> (
+    Arc<SubscriptionManager>,
+    Vec<mpsc::UnboundedReceiver<Arc<Bytes>>>,
+) {
     let mgr = Arc::new(SubscriptionManager::new());
     let mut rxs = Vec::with_capacity(n);
     for i in 0..n {
         let (tx, rx) = mpsc::unbounded_channel::<Arc<Bytes>>();
         let cid = mgr.register_client(tx);
-        mgr.subscribe(cid, format!("sub_{}", i), table.to_string()).unwrap();
+        mgr.subscribe(cid, format!("sub_{}", i), table.to_string())
+            .unwrap();
         rxs.push(rx);
     }
     (mgr, rxs)
@@ -112,18 +118,16 @@ fn bench_scenario1_pure_engine(c: &mut Criterion) {
                             std::thread::spawn(move || {
                                 for _ in 0..5_000 {
                                     let mut ctx = ReducerContext::new(tbl.clone(), 1000);
-                                    increment_reducer(
-                                        &mut ctx,
-                                        format!("counter_{}", i % 256),
-                                        1,
-                                    )
-                                    .unwrap();
+                                    increment_reducer(&mut ctx, format!("counter_{}", i % 256), 1)
+                                        .unwrap();
                                     ctx.commit().unwrap();
                                 }
                             })
                         })
                         .collect();
-                    for h in handles { h.join().unwrap(); }
+                    for h in handles {
+                        h.join().unwrap();
+                    }
                 });
             },
         );
@@ -192,15 +196,31 @@ fn bench_scenario3_game_genres(c: &mut Criterion) {
     }
 
     let genres = [
-        Genre { name: "fps_position_tick",  subscribers: 0,  writes_per_call: 2 },
-        Genre { name: "idle_clicker",       subscribers: 0,  writes_per_call: 1 },
-        Genre { name: "moba_state_tick",    subscribers: 16, writes_per_call: 4 },
-        Genre { name: "racing_tick",        subscribers: 12, writes_per_call: 3 },
+        Genre {
+            name: "fps_position_tick",
+            subscribers: 0,
+            writes_per_call: 2,
+        },
+        Genre {
+            name: "idle_clicker",
+            subscribers: 0,
+            writes_per_call: 1,
+        },
+        Genre {
+            name: "moba_state_tick",
+            subscribers: 16,
+            writes_per_call: 4,
+        },
+        Genre {
+            name: "racing_tick",
+            subscribers: 12,
+            writes_per_call: 3,
+        },
     ];
 
     for genre in &genres {
-        let n_writes  = genre.writes_per_call;
-        let n_subs    = genre.subscribers;
+        let n_writes = genre.writes_per_call;
+        let n_subs = genre.subscribers;
         let genre_name = genre.name;
 
         group.throughput(Throughput::Elements(n_writes as u64));
@@ -220,7 +240,8 @@ fn bench_scenario3_game_genres(c: &mut Criterion) {
                         "players".to_string(),
                         key.clone(),
                         serde_json::json!({"x": 1.0, "y": 2.0, "hp": 100}),
-                    ).unwrap();
+                    )
+                    .unwrap();
                 }
                 let deltas = ctx.commit().unwrap();
                 mgr.publish_deltas(black_box(&deltas));

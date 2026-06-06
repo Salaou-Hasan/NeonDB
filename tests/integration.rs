@@ -1,11 +1,12 @@
 use futures::{future::join_all, SinkExt, StreamExt};
+use neondb::network::message::{ClientMessage, ReducerCall, ServerMessage};
 use rmp_serde::Serializer;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
-use neondb::network::message::{ClientMessage, ReducerCall, ServerMessage};
 
 #[derive(Serialize, Deserialize)]
 struct IncrementArgs {
@@ -49,6 +50,10 @@ fn ensure_server_built() {
 }
 
 fn spawn_server(port: u16, wal_path: PathBuf) -> Child {
+    spawn_server_with_env(port, wal_path, &[])
+}
+
+fn spawn_server_with_env(port: u16, wal_path: PathBuf, extra_env: &[(&str, &str)]) -> Child {
     ensure_server_built();
     let binary = server_binary_path();
 
@@ -60,7 +65,40 @@ fn spawn_server(port: u16, wal_path: PathBuf) -> Child {
         .stdout(Stdio::null())
         .stderr(Stdio::null());
 
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+
     cmd.spawn().expect("Failed to spawn NeonDB server")
+}
+
+/// Build a proper WebSocket upgrade request with an `Authorization: Bearer` header.
+/// Uses `IntoClientRequest` so all required WebSocket headers (Upgrade, Connection,
+/// Sec-WebSocket-Key, etc.) are populated automatically from the URL.
+fn bearer_request(url: &str, api_key: &str) -> tokio_tungstenite::tungstenite::http::Request<()> {
+    let mut req = url.into_client_request().expect("valid ws url");
+    req.headers_mut().insert(
+        "authorization",
+        format!("Bearer {}", api_key)
+            .parse()
+            .expect("valid header value"),
+    );
+    req
+}
+
+/// Wait for the server to accept WebSocket connections that include a Bearer token.
+async fn wait_for_server_ready_with_auth(url: &str, timeout: Duration, api_key: &str) {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if tokio_tungstenite::connect_async(bearer_request(url, api_key))
+            .await
+            .is_ok()
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("Server did not become ready within {:?}", timeout);
 }
 
 async fn wait_for_server_ready(url: &str, timeout: Duration) {
@@ -178,7 +216,10 @@ async fn integration_invalid_message_returns_error_but_server_stays_alive() {
 
     match response {
         ServerMessage::Error { message } => {
-            assert!(message.len() > 0, "Expected error message on invalid payload");
+            assert!(
+                message.len() > 0,
+                "Expected error message on invalid payload"
+            );
         }
         other => panic!("Expected error response, got: {:?}", other),
     }
@@ -329,9 +370,14 @@ async fn integration_subscription_notifications() {
         _ => panic!("Unexpected message type for subscribe ack"),
     };
 
-    let ack: ServerMessage = rmp_serde::from_slice(&ack_bytes).expect("Failed to decode subscribe ack");
+    let ack: ServerMessage =
+        rmp_serde::from_slice(&ack_bytes).expect("Failed to decode subscribe ack");
     match ack {
-        ServerMessage::SubscriptionAck { subscription_id, success, message } => {
+        ServerMessage::SubscriptionAck {
+            subscription_id,
+            success,
+            message,
+        } => {
             assert_eq!(subscription_id, "sub1");
             assert!(success, "Subscription ack reported failure: {:?}", message);
         }
@@ -377,6 +423,75 @@ async fn integration_subscription_notifications() {
     }
 
     assert!(found_diff, "Did not receive subscription diff notification");
+
+    child.kill().expect("Failed to kill server process");
+    let _ = child.wait();
+    let _ = std::fs::remove_file(&wal_path);
+}
+
+/// A server configured with NEONDB_API_KEY must reject connections that do not
+/// supply a matching `Authorization: Bearer <key>` header.
+#[tokio::test]
+async fn integration_api_key_rejects_unauthorized() {
+    let port = 18084;
+    let wal_path = std::env::temp_dir().join("neondb_integration_auth.wal");
+    let _ = std::fs::remove_file(&wal_path);
+
+    let mut child =
+        spawn_server_with_env(port, wal_path.clone(), &[("NEONDB_API_KEY", "supersecret")]);
+    let ws_url = format!("ws://127.0.0.1:{}", port);
+    wait_for_server_ready_with_auth(&ws_url, Duration::from_secs(5), "supersecret").await;
+
+    // Connection with no Authorization header must be rejected.
+    let plain = tokio_tungstenite::connect_async(&ws_url).await;
+    assert!(
+        plain.is_err(),
+        "Connection without API key should be rejected, but succeeded"
+    );
+
+    // Connection with wrong key must also be rejected.
+    let wrong = tokio_tungstenite::connect_async(bearer_request(&ws_url, "wrongkey")).await;
+    assert!(
+        wrong.is_err(),
+        "Connection with wrong API key should be rejected, but succeeded"
+    );
+
+    // Connection with correct key must succeed.
+    let good = tokio_tungstenite::connect_async(bearer_request(&ws_url, "supersecret")).await;
+    assert!(
+        good.is_ok(),
+        "Connection with correct API key should succeed"
+    );
+
+    child.kill().expect("Failed to kill server process");
+    let _ = child.wait();
+    let _ = std::fs::remove_file(&wal_path);
+}
+
+/// A server with no API key set must accept all connections (open access).
+#[tokio::test]
+async fn integration_no_api_key_accepts_all() {
+    let port = 18085;
+    let wal_path = std::env::temp_dir().join("neondb_integration_noauth.wal");
+    let _ = std::fs::remove_file(&wal_path);
+
+    let mut child = spawn_server(port, wal_path.clone());
+    let ws_url = format!("ws://127.0.0.1:{}", port);
+    wait_for_server_ready(&ws_url, Duration::from_secs(5)).await;
+
+    // Plain connection (no headers) must succeed.
+    let plain = tokio_tungstenite::connect_async(&ws_url).await;
+    assert!(
+        plain.is_ok(),
+        "Connection without key should succeed when no API key is configured"
+    );
+
+    // Connection with any Authorization header must also succeed.
+    let keyed = tokio_tungstenite::connect_async(bearer_request(&ws_url, "whatever")).await;
+    assert!(
+        keyed.is_ok(),
+        "Connection with extra auth header should still succeed when no API key is configured"
+    );
 
     child.kill().expect("Failed to kill server process");
     let _ = child.wait();

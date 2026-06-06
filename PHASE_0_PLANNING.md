@@ -21,7 +21,7 @@
 
 ## Executive Summary
 
-**NeonDB** is a unified in-memory database + application server designed to match or exceed SpacetimeDB's performance (304k TPS TypeScript, 266k TPS Rust) while being 100% self-hostable on consumer hardware via Coolify with zero cloud fees.
+**NeonDB** is a unified in-memory database + application server designed to match or exceed SpacetimeDB's performance (304k TPS TypeScript, 266k TPS Rust) while being 100% self-hostable on consumer hardware via Dokploy with zero cloud fees.
 
 **Key Design Principles:**
 - Single-threaded execution model (maximize CPU cache locality, eliminate lock contention)
@@ -157,7 +157,7 @@
 | Component | Choice | Rationale |
 |-----------|--------|-----------|
 | **Container** | **Docker** (single stage build) | Multi-stage: build server in Rust, copy binary to slim base (scratch or Alpine). Expose WebSocket port (default 8000), volume for `/data/wal`. |
-| **Orchestration** | **Coolify** (Docker Compose under the hood) | User clicks "Deploy from Git", sets `NEONDB_PORT`, `NEONDB_WAL_PATH`, `NEONDB_FSYNC_INTERVAL_MS`, done in <5 min. |
+| **Orchestration** | **Dokploy** (Docker Compose under the hood) | User deploys via Dokploy dashboard, sets env vars, done in <5 min. Auto TLS via Traefik. |
 | **Database Schema** | **Schema-as-code** (TOML or JSON) + migrations via WAL replay | No SQL DDL. Instead, define tables in a `schema.neondb` file. On server startup, if tables don't exist, create them. Migrations = replay WAL with new reducer logic. |
 | **CLI Tool** | **Rust binary** (`neondb-cli`) | `neondb init`, `neondb build`, `neondb run`, `neondb migrate`. Published on crates.io and as GitHub releases. |
 
@@ -286,7 +286,7 @@ NeonDB/
 ├── Cargo.lock
 ├── README.md                               # Project overview
 ├── PHASE_0_PLANNING.md                     # This file
-├── DEPLOYMENT.md                           # Docker, Coolify, env vars
+├── DEPLOYMENT.md                           # Docker, Dokploy, env vars
 └── PERFORMANCE.md                          # Benchmarks, optimization notes
 
 ```
@@ -358,7 +358,7 @@ All estimates assume **1 senior full-stack engineer** with Rust + systems knowle
 | **2** | User-Defined Reducers (WASM & TS) | **12–15** | V8 integration is the long pole. Wasmtime is straightforward. Testing both paths. ~5 days just for V8 prototyping. |
 | **3** | Subscription Engine & Incremental Updates | **10–12** | Query parsing (simple), matcher (straightforward), diff algorithm (complex if naive). Heavy testing. |
 | **4** | Client SDKs (TS + Rust) | **8–10** | TS SDK: 4 days, Rust SDK: 3 days, React hooks: 2 days, test examples: 2 days. Well-trodden path. |
-| **5** | Production Readiness & Coolify Deploy | **6–8** | Docker, docker-compose, env var handling, CLI enhancements, graceful shutdown, config file. Straightforward. |
+| **5** | Production Readiness & Dokploy Deploy | **6–8** | Docker, docker-compose, env var handling, CLI enhancements, graceful shutdown, config file. Straightforward. |
 | **6** | Performance Tuning & Benchmarking | **7–10** | Profiling, optimization loops, report writing, final soak tests. Unpredictable—depends on findings. |
 | **7** (Optional) | Optional: Snapshots & Distributed Replication | **20+** | Not in V1 scope. Future work. |
 
@@ -377,7 +377,7 @@ Phase 3 (10 days) → Subscription diff algorithm; profile; optimize if needed (
   ↓
 Phase 4 (8 days) → Client SDKs; test with examples
   ↓
-Phase 5 (6 days) → Docker, Coolify setup
+Phase 5 (6 days) → Docker, Dokploy setup
   ↓
 Phase 6 (7 days) → Soak tests, benchmarks, optimization report
 ```
@@ -429,12 +429,12 @@ You provide explicit go/no-go. If issues arise, we pivot or extend the phase.
 - [ ] Docker image builds with `docker build -t neondb-server .`
 - [ ] `docker-compose up` starts server + volume persistence
 - [ ] Env vars: `NEONDB_PORT`, `NEONDB_WAL_PATH`, `NEONDB_FSYNC_INTERVAL_MS` work
-- [ ] Deployed to Coolify, accessible from external client within 5 minutes
+- [ ] Deployed to Dokploy, accessible from external client within 5 minutes
 
 ### Phase 6 Acceptance (Production Ready)
 - [ ] Soak test: 10 simulated players, 1000 reducers/second each, 24 hours, zero crashes
 - [ ] Crash recovery: 10 GB WAL replayed and ready in <5 seconds
-- [ ] Newbie can deploy to Coolify in <5 minutes with setup instructions
+- [ ] Newbie can deploy to Dokploy in <5 minutes with setup instructions
 - [ ] Example game (tic-tac-toe or MMO movement) runs without observable lag
 - [ ] **Benchmarking tool**: Standalone binary that simulates multiple clients, measures p50/p95/p99 latency and TPS (included as part of deliverable, not just a script)
 - [ ] Benchmark report: TPS & latency (p99) vs. published SpacetimeDB numbers

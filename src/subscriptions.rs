@@ -50,25 +50,69 @@ pub struct SubscriptionFilter {
     pub predicate: Option<Predicate>,
 }
 
+/// A subscription predicate — a node in the filter expression tree.
 #[derive(Clone, Debug)]
-pub struct Predicate {
-    pub field: String,
-    pub op: ComparisonOp,
-    pub value: Value,
+pub enum Predicate {
+    /// Single-field comparison: `field op value`
+    Comparison {
+        field: String,
+        op: ComparisonOp,
+        value: Value,
+    },
+    /// Set-membership test: `field IN (v1, v2, ...)`
+    In { field: String, values: Vec<Value> },
+    /// Logical AND of two sub-predicates: `left AND right`
+    And(Box<Predicate>, Box<Predicate>),
 }
 
 #[derive(Clone, Debug)]
 pub enum ComparisonOp {
-    Eq, Ne, Gt, Lt, Ge, Le,
+    Eq,
+    Ne,
+    Gt,
+    Lt,
+    Ge,
+    Le,
 }
 
 impl ComparisonOp {
     pub fn from_str(op: &str) -> Option<Self> {
         match op {
-            "==" => Some(Self::Eq), "!=" => Some(Self::Ne),
-            ">=" => Some(Self::Ge), "<=" => Some(Self::Le),
-            ">"  => Some(Self::Gt), "<"  => Some(Self::Lt),
-            _    => None,
+            "==" => Some(Self::Eq),
+            "!=" => Some(Self::Ne),
+            ">=" => Some(Self::Ge),
+            "<=" => Some(Self::Le),
+            ">" => Some(Self::Gt),
+            "<" => Some(Self::Lt),
+            _ => None,
+        }
+    }
+}
+
+impl ComparisonOp {
+    /// Returns true if `actual` satisfies `self op expected`.
+    pub fn compare(&self, actual: Option<&Value>, expected: &Value) -> bool {
+        let Some(actual) = actual else {
+            return false;
+        };
+        match (self, actual) {
+            (Self::Eq, Value::String(s)) => matches!(expected, Value::String(e) if s == e),
+            (Self::Ne, Value::String(s)) => matches!(expected, Value::String(e) if s != e),
+            (Self::Eq, Value::Number(n)) => matches!(expected, Value::Number(e) if n == e),
+            (Self::Ne, Value::Number(n)) => matches!(expected, Value::Number(e) if n != e),
+            (Self::Gt, Value::Number(n)) => matches!(expected, Value::Number(e) if
+                compare_number(n, e) == Some(std::cmp::Ordering::Greater)),
+            (Self::Lt, Value::Number(n)) => matches!(expected, Value::Number(e) if
+                compare_number(n, e) == Some(std::cmp::Ordering::Less)),
+            (Self::Ge, Value::Number(n)) => matches!(expected, Value::Number(e) if
+                matches!(compare_number(n, e),
+                    Some(std::cmp::Ordering::Greater) | Some(std::cmp::Ordering::Equal))),
+            (Self::Le, Value::Number(n)) => matches!(expected, Value::Number(e) if
+                matches!(compare_number(n, e),
+                    Some(std::cmp::Ordering::Less) | Some(std::cmp::Ordering::Equal))),
+            (Self::Eq, Value::Bool(b)) => matches!(expected, Value::Bool(e) if b == e),
+            (Self::Ne, Value::Bool(b)) => matches!(expected, Value::Bool(e) if b != e),
+            _ => false,
         }
     }
 }
@@ -102,12 +146,17 @@ impl EncodedFrame {
             row_data: delta.row_data.clone(),
         };
         let msg = ServerMessage::SubscriptionDiff(diff);
-        rmp_serde::to_vec(&msg)
-            .ok()
-            .map(|b| EncodedFrame { bytes: Arc::new(Bytes::from(b)) })
+        rmp_serde::to_vec(&msg).ok().map(|b| EncodedFrame {
+            bytes: Arc::new(Bytes::from(b)),
+        })
     }
 
-    fn encode_snapshot(sub_id: &str, table_name: &str, row_key: &str, row_data: Value) -> Option<Self> {
+    fn encode_snapshot(
+        sub_id: &str,
+        table_name: &str,
+        row_key: &str,
+        row_data: Value,
+    ) -> Option<Self> {
         let diff = SubscriptionDiff {
             subscription_id: sub_id.to_string(),
             table_name: table_name.to_string(),
@@ -116,9 +165,9 @@ impl EncodedFrame {
             row_data: Some(row_data),
         };
         let msg = ServerMessage::SubscriptionDiff(diff);
-        rmp_serde::to_vec(&msg)
-            .ok()
-            .map(|b| EncodedFrame { bytes: Arc::new(Bytes::from(b)) })
+        rmp_serde::to_vec(&msg).ok().map(|b| EncodedFrame {
+            bytes: Arc::new(Bytes::from(b)),
+        })
     }
 }
 
@@ -141,10 +190,13 @@ impl SubscriptionManager {
 
     pub fn register_client(&self, tx: UnboundedSender<Arc<Bytes>>) -> ClientId {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.clients.insert(id, Arc::new(ClientInfo {
-            tx,
-            subscriptions: DashMap::new(),
-        }));
+        self.clients.insert(
+            id,
+            Arc::new(ClientInfo {
+                tx,
+                subscriptions: DashMap::new(),
+            }),
+        );
         id
     }
 
@@ -189,10 +241,9 @@ impl SubscriptionManager {
         let filter = parse_subscription_query(&query)?;
         let table_name = filter.table_name.clone();
 
-        let client = self.clients.get(&client_id)
-            .ok_or_else(|| NeonDBError::invalid_argument(
-                format!("Unknown client: {}", client_id),
-            ))?;
+        let client = self.clients.get(&client_id).ok_or_else(|| {
+            NeonDBError::invalid_argument(format!("Unknown client: {}", client_id))
+        })?;
 
         let subscription = Subscription {
             id: subscription_id.clone(),
@@ -200,7 +251,9 @@ impl SubscriptionManager {
         };
 
         // ── Register in per-client map and reverse index (BEFORE snapshot) ───
-        client.subscriptions.insert(subscription_id.clone(), subscription);
+        client
+            .subscriptions
+            .insert(subscription_id.clone(), subscription);
 
         self.table_index
             .entry(table_name.clone())
@@ -213,37 +266,30 @@ impl SubscriptionManager {
         // After registration, snapshot all currently matching rows and push
         // them to the client as "initial_snapshot" frames.
         if let Some(tables) = tables {
-            if let Ok(rows) = tables.list_rows(&table_name) {
+            if let Ok(rows) = tables.list_rows_with_keys(&table_name) {
                 let tx = client.tx.clone();
-                for row_value in rows {
-                    // Apply predicate to each existing row
-                    let row_key = row_value
-                        .get("row_key")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-
-                    let matches = match &filter.predicate {
-                        None => true,
-                        Some(pred) => {
-                            let actual = if pred.field == "row_key" {
-                                Some(Value::String(row_key.clone()))
-                            } else {
-                                row_value.get(&pred.field).cloned()
-                            };
-                            pred.matches(actual.as_ref())
-                        }
+                for (row_key, row_value) in rows {
+                    // Build a synthetic delta so SubscriptionFilter::matches
+                    // (including compound AND / IN predicates) can be reused
+                    // without duplicating field-extraction logic.
+                    let synthetic = RowDelta {
+                        table_name: table_name.clone(),
+                        operation: "initial_snapshot".to_string(),
+                        row_key: row_key.clone(),
+                        row_id: 0,
+                        shard_id: 0,
+                        payload_arc: None,
+                        row_data: Some(row_value.clone()),
+                        counter_add_amount: 0,
+                        counter_add_timestamp: 0,
                     };
-
-                    if matches {
+                    if filter.matches(&synthetic) {
                         if let Some(frame) = EncodedFrame::encode_snapshot(
                             &subscription_id,
                             &table_name,
                             &row_key,
                             row_value,
                         ) {
-                            // Non-blocking send — if the channel is closed the
-                            // client disconnected before we could snapshot.
                             let _ = tx.send(frame.bytes);
                         }
                     }
@@ -255,10 +301,9 @@ impl SubscriptionManager {
     }
 
     pub fn unsubscribe(&self, client_id: ClientId, subscription_id: &str) -> Result<bool> {
-        let client = self.clients.get(&client_id)
-            .ok_or_else(|| NeonDBError::invalid_argument(
-                format!("Unknown client: {}", client_id),
-            ))?;
+        let client = self.clients.get(&client_id).ok_or_else(|| {
+            NeonDBError::invalid_argument(format!("Unknown client: {}", client_id))
+        })?;
 
         if let Some((_, sub)) = client.subscriptions.remove(subscription_id) {
             let table_name = &sub.filter.table_name;
@@ -297,24 +342,24 @@ impl SubscriptionManager {
         for delta in deltas {
             let table_entry = match self.table_index.get(&delta.table_name) {
                 Some(e) => e,
-                None    => continue,
+                None => continue,
             };
 
             let mut matching: Vec<(UnboundedSender<Arc<Bytes>>, String)> = Vec::new();
 
             for client_entry in table_entry.iter() {
                 let client_id = *client_entry.key();
-                let sub_ids   = client_entry.value();
+                let sub_ids = client_entry.value();
 
                 let client = match self.clients.get(&client_id) {
                     Some(c) => c,
-                    None    => continue,
+                    None => continue,
                 };
 
                 for sub_id in sub_ids.iter() {
                     let sub = match client.subscriptions.get(sub_id) {
                         Some(s) => s,
-                        None    => continue,
+                        None => continue,
                     };
 
                     if sub.filter.matches(delta) {
@@ -366,57 +411,53 @@ impl SubscriptionFilter {
         if self.table_name != delta.table_name {
             return false;
         }
-        let Some(predicate) = &self.predicate else { return true; };
-        let row_value = delta.row_data_value();
-        let actual = row_value.as_ref().and_then(|v| {
-            if predicate.field == "row_key" {
-                Some(Value::String(delta.row_key.clone()))
-            } else {
-                v.get(&predicate.field).cloned()
-            }
-        });
-        predicate.matches(actual.as_ref())
-    }
-}
-
-impl Predicate {
-    pub fn matches(&self, actual: Option<&Value>) -> bool {
-        let Some(actual) = actual else { return false; };
-        match (&self.op, actual) {
-            (ComparisonOp::Eq, Value::String(s)) =>
-                matches!(&self.value, Value::String(e) if s == e),
-            (ComparisonOp::Ne, Value::String(s)) =>
-                matches!(&self.value, Value::String(e) if s != e),
-            (ComparisonOp::Eq, Value::Number(n)) =>
-                matches!(&self.value, Value::Number(e) if n == e),
-            (ComparisonOp::Ne, Value::Number(n)) =>
-                matches!(&self.value, Value::Number(e) if n != e),
-            (ComparisonOp::Gt, Value::Number(n)) =>
-                matches!(&self.value, Value::Number(e) if
-                    compare_number(n, e) == Some(std::cmp::Ordering::Greater)),
-            (ComparisonOp::Lt, Value::Number(n)) =>
-                matches!(&self.value, Value::Number(e) if
-                    compare_number(n, e) == Some(std::cmp::Ordering::Less)),
-            (ComparisonOp::Ge, Value::Number(n)) =>
-                matches!(&self.value, Value::Number(e) if
-                    matches!(compare_number(n, e),
-                        Some(std::cmp::Ordering::Greater) | Some(std::cmp::Ordering::Equal))),
-            (ComparisonOp::Le, Value::Number(n)) =>
-                matches!(&self.value, Value::Number(e) if
-                    matches!(compare_number(n, e),
-                        Some(std::cmp::Ordering::Less) | Some(std::cmp::Ordering::Equal))),
-            _ => false,
+        match &self.predicate {
+            None => true,
+            Some(p) => p.eval(delta),
         }
     }
 }
 
-fn compare_number(
-    l: &serde_json::Number,
-    r: &serde_json::Number,
-) -> Option<std::cmp::Ordering> {
-    if let (Some(a), Some(b)) = (l.as_i64(), r.as_i64()) { return Some(a.cmp(&b)); }
-    if let (Some(a), Some(b)) = (l.as_u64(), r.as_u64()) { return Some(a.cmp(&b)); }
-    if let (Some(a), Some(b)) = (l.as_f64(), r.as_f64()) { return a.partial_cmp(&b); }
+impl Predicate {
+    /// Evaluate this predicate against a row delta.
+    /// For compound predicates (AND) each sub-tree evaluates independently
+    /// against the same delta — enabling multi-column WHERE clauses.
+    pub fn eval(&self, delta: &RowDelta) -> bool {
+        match self {
+            Predicate::Comparison { field, op, value } => {
+                let actual = Self::extract_field(delta, field);
+                op.compare(actual.as_ref(), value)
+            }
+            Predicate::In { field, values } => {
+                let actual = Self::extract_field(delta, field);
+                match actual {
+                    None => false,
+                    Some(v) => values.contains(&v),
+                }
+            }
+            Predicate::And(left, right) => left.eval(delta) && right.eval(delta),
+        }
+    }
+
+    fn extract_field(delta: &RowDelta, field: &str) -> Option<Value> {
+        if field == "row_key" {
+            Some(Value::String(delta.row_key.clone()))
+        } else {
+            delta.row_data_value()?.get(field).cloned()
+        }
+    }
+}
+
+fn compare_number(l: &serde_json::Number, r: &serde_json::Number) -> Option<std::cmp::Ordering> {
+    if let (Some(a), Some(b)) = (l.as_i64(), r.as_i64()) {
+        return Some(a.cmp(&b));
+    }
+    if let (Some(a), Some(b)) = (l.as_u64(), r.as_u64()) {
+        return Some(a.cmp(&b));
+    }
+    if let (Some(a), Some(b)) = (l.as_f64(), r.as_f64()) {
+        return a.partial_cmp(&b);
+    }
     None
 }
 
@@ -441,38 +482,93 @@ fn parse_subscription_query(query: &str) -> Result<SubscriptionFilter> {
             "Subscription query missing table name",
         ));
     }
-    let predicate = predicate
-        .map(|p| parse_predicate(p.trim()))
-        .transpose()?;
+    let predicate = predicate.map(|p| parse_predicate(p.trim())).transpose()?;
     Ok(SubscriptionFilter {
         table_name: table_name.to_string(),
         predicate,
     })
 }
 
+/// Parse a WHERE clause into a (possibly compound) Predicate tree.
+///
+/// Grammar (simplified):
+///   predicate  = comparison | in_expr | predicate AND predicate
+///   comparison = field op value
+///   in_expr    = field IN ( value, ... )
+///   op         = == | != | > | < | >= | <=
 fn parse_predicate(predicate: &str) -> Result<Predicate> {
+    // ── 1. Split on AND at depth 0 (parens-aware) ─────────────────────────────
+    if let Some((left_str, right_str)) = split_on_and(predicate) {
+        let left = parse_predicate(left_str)?;
+        let right = parse_predicate(right_str)?;
+        return Ok(Predicate::And(Box::new(left), Box::new(right)));
+    }
+
+    // ── 2. Detect IN operator ─────────────────────────────────────────────────
+    // Pattern (case-insensitive):  <field> IN ( <value>, ... )
+    let lower = predicate.to_lowercase();
+    if let Some(in_pos) = lower.find(" in ") {
+        let field = predicate[..in_pos].trim().to_string();
+        let rest = predicate[in_pos + 4..].trim();
+        if rest.starts_with('(') && rest.ends_with(')') {
+            let inner = &rest[1..rest.len() - 1];
+            let values = inner
+                .split(',')
+                .map(|s| parse_predicate_value(s.trim()))
+                .collect::<Result<Vec<_>>>()?;
+            return Ok(Predicate::In { field, values });
+        }
+    }
+
+    // ── 3. Fall back to single comparison ─────────────────────────────────────
+    parse_comparison(predicate)
+}
+
+/// Split `predicate` on the first ` AND ` (case-insensitive) that is NOT
+/// inside parentheses.  Returns `Some((left, right))` or `None`.
+fn split_on_and(predicate: &str) -> Option<(&str, &str)> {
+    let bytes = predicate.as_bytes();
+    let mut depth = 0usize;
+    let mut i = 0;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            _ => {
+                if depth == 0 && i + 5 <= bytes.len() {
+                    let window = &bytes[i..i + 5];
+                    if window.eq_ignore_ascii_case(b" and ") {
+                        return Some((predicate[..i].trim(), predicate[i + 5..].trim()));
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Parse a single comparison clause (`field op value`).
+fn parse_comparison(predicate: &str) -> Result<Predicate> {
     for op in [">=", "<=", "==", "!=", ">", "<"] {
         if let Some(idx) = predicate.find(op) {
-            let field = predicate[..idx].trim();
+            let field = predicate[..idx].trim().to_string();
             let value_part = predicate[idx + op.len()..].trim();
             let op = ComparisonOp::from_str(op)
                 .ok_or_else(|| NeonDBError::invalid_argument("Unsupported comparator"))?;
             let value = parse_predicate_value(value_part)?;
-            return Ok(Predicate {
-                field: field.to_string(),
-                op,
-                value,
-            });
+            return Ok(Predicate::Comparison { field, op, value });
         }
     }
-    Err(NeonDBError::invalid_argument("Subscription predicate invalid"))
+    Err(NeonDBError::invalid_argument(
+        "Subscription predicate invalid",
+    ))
 }
 
 fn parse_predicate_value(value: &str) -> Result<Value> {
     let t = value.trim();
-    if (t.starts_with('"') && t.ends_with('"'))
-        || (t.starts_with('\'') && t.ends_with('\''))
-    {
+    if (t.starts_with('"') && t.ends_with('"')) || (t.starts_with('\'') && t.ends_with('\'')) {
         return Ok(Value::String(t[1..t.len() - 1].to_string()));
     }
     if let Ok(i) = t.parse::<i64>() {
@@ -483,8 +579,12 @@ fn parse_predicate_value(value: &str) -> Result<Value> {
             .map(Value::Number)
             .ok_or_else(|| NeonDBError::invalid_argument("Invalid numeric literal"))?);
     }
-    if t.eq_ignore_ascii_case("true")  { return Ok(Value::Bool(true));  }
-    if t.eq_ignore_ascii_case("false") { return Ok(Value::Bool(false)); }
+    if t.eq_ignore_ascii_case("true") {
+        return Ok(Value::Bool(true));
+    }
+    if t.eq_ignore_ascii_case("false") {
+        return Ok(Value::Bool(false));
+    }
     Ok(Value::String(t.to_string()))
 }
 
@@ -504,6 +604,8 @@ mod tests {
             shard_id: 0,
             payload_arc: None,
             row_data: Some(data),
+            counter_add_amount: 0,
+            counter_add_timestamp: 0,
         }
     }
 
@@ -544,8 +646,10 @@ mod tests {
         let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel::<Arc<Bytes>>();
         let id1 = mgr.register_client(tx1);
         let id2 = mgr.register_client(tx2);
-        mgr.subscribe(id1, "s1".to_string(), "counters".to_string()).unwrap();
-        mgr.subscribe(id2, "s2".to_string(), "counters".to_string()).unwrap();
+        mgr.subscribe(id1, "s1".to_string(), "counters".to_string())
+            .unwrap();
+        mgr.subscribe(id2, "s2".to_string(), "counters".to_string())
+            .unwrap();
 
         let deltas = vec![make_delta("counters", "k", serde_json::json!({"v": 1}))];
         mgr.publish_deltas(&deltas);
@@ -558,10 +662,16 @@ mod tests {
         let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel::<Arc<Bytes>>();
         let id1 = mgr.register_client(tx1);
         let id2 = mgr.register_client(tx2);
-        mgr.subscribe(id1, "world_sync".to_string(), "players".to_string()).unwrap();
-        mgr.subscribe(id2, "world_sync".to_string(), "players".to_string()).unwrap();
+        mgr.subscribe(id1, "world_sync".to_string(), "players".to_string())
+            .unwrap();
+        mgr.subscribe(id2, "world_sync".to_string(), "players".to_string())
+            .unwrap();
 
-        let deltas = vec![make_delta("players", "hero_1", serde_json::json!({"hp": 100}))];
+        let deltas = vec![make_delta(
+            "players",
+            "hero_1",
+            serde_json::json!({"hp": 100}),
+        )];
         mgr.publish_deltas(&deltas);
 
         let frame1 = rx1.try_recv().expect("client 1 should receive");
@@ -581,10 +691,16 @@ mod tests {
         let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel::<Arc<Bytes>>();
         let id1 = mgr.register_client(tx1);
         let id2 = mgr.register_client(tx2);
-        mgr.subscribe(id1, "sub_client_1".to_string(), "counters".to_string()).unwrap();
-        mgr.subscribe(id2, "sub_client_2".to_string(), "counters".to_string()).unwrap();
+        mgr.subscribe(id1, "sub_client_1".to_string(), "counters".to_string())
+            .unwrap();
+        mgr.subscribe(id2, "sub_client_2".to_string(), "counters".to_string())
+            .unwrap();
 
-        let deltas = vec![make_delta("counters", "score", serde_json::json!({"value": 42}))];
+        let deltas = vec![make_delta(
+            "counters",
+            "score",
+            serde_json::json!({"value": 42}),
+        )];
         mgr.publish_deltas(&deltas);
 
         let frame1 = rx1.try_recv().expect("client 1 should receive");
@@ -608,18 +724,38 @@ mod tests {
     fn publish_deltas_predicate_filters_correctly() {
         let mgr = SubscriptionManager::new();
         let (tx_match, mut rx_match) = tokio::sync::mpsc::unbounded_channel::<Arc<Bytes>>();
-        let (tx_skip,  mut rx_skip)  = tokio::sync::mpsc::unbounded_channel::<Arc<Bytes>>();
+        let (tx_skip, mut rx_skip) = tokio::sync::mpsc::unbounded_channel::<Arc<Bytes>>();
         let id_match = mgr.register_client(tx_match);
-        let id_skip  = mgr.register_client(tx_skip);
+        let id_skip = mgr.register_client(tx_skip);
 
-        mgr.subscribe(id_match, "high".to_string(), "counters WHERE value >= 10".to_string()).unwrap();
-        mgr.subscribe(id_skip,  "low".to_string(),  "counters WHERE value >= 100".to_string()).unwrap();
+        mgr.subscribe(
+            id_match,
+            "high".to_string(),
+            "counters WHERE value >= 10".to_string(),
+        )
+        .unwrap();
+        mgr.subscribe(
+            id_skip,
+            "low".to_string(),
+            "counters WHERE value >= 100".to_string(),
+        )
+        .unwrap();
 
-        let deltas = vec![make_delta("counters", "score", serde_json::json!({"value": 42}))];
+        let deltas = vec![make_delta(
+            "counters",
+            "score",
+            serde_json::json!({"value": 42}),
+        )];
         mgr.publish_deltas(&deltas);
 
-        assert!(rx_match.try_recv().is_ok(), "matching predicate should receive");
-        assert!(rx_skip.try_recv().is_err(), "non-matching predicate should be filtered");
+        assert!(
+            rx_match.try_recv().is_ok(),
+            "matching predicate should receive"
+        );
+        assert!(
+            rx_skip.try_recv().is_err(),
+            "non-matching predicate should be filtered"
+        );
     }
 
     #[test]
@@ -634,7 +770,8 @@ mod tests {
         let mgr = SubscriptionManager::new();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Arc<Bytes>>();
         let cid = mgr.register_client(tx);
-        mgr.subscribe(cid, "s".to_string(), "players".to_string()).unwrap();
+        mgr.subscribe(cid, "s".to_string(), "players".to_string())
+            .unwrap();
 
         let deltas = vec![make_delta("counters", "k", serde_json::json!({"v": 1}))];
         mgr.publish_deltas(&deltas);
@@ -649,14 +786,22 @@ mod tests {
         let id_a = mgr.register_client(tx_a);
         let id_b = mgr.register_client(tx_b);
 
-        mgr.subscribe(id_a, "sa".to_string(), "table_alpha".to_string()).unwrap();
-        mgr.subscribe(id_b, "sb".to_string(), "table_beta".to_string()).unwrap();
+        mgr.subscribe(id_a, "sa".to_string(), "table_alpha".to_string())
+            .unwrap();
+        mgr.subscribe(id_b, "sb".to_string(), "table_beta".to_string())
+            .unwrap();
 
         let deltas = vec![make_delta("table_alpha", "k1", serde_json::json!({"x": 1}))];
         mgr.publish_deltas(&deltas);
 
-        assert!(rx_a.try_recv().is_ok(),  "table_alpha subscriber must receive");
-        assert!(rx_b.try_recv().is_err(), "table_beta subscriber must NOT receive");
+        assert!(
+            rx_a.try_recv().is_ok(),
+            "table_alpha subscriber must receive"
+        );
+        assert!(
+            rx_b.try_recv().is_err(),
+            "table_beta subscriber must NOT receive"
+        );
     }
 
     #[test]
@@ -665,11 +810,18 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Arc<Bytes>>();
         let cid = mgr.register_client(tx);
 
-        mgr.subscribe(cid, "sub1".to_string(), "counters".to_string()).unwrap();
+        mgr.subscribe(cid, "sub1".to_string(), "counters".to_string())
+            .unwrap();
         mgr.unsubscribe(cid, "sub1").unwrap();
 
-        assert!(mgr.table_index.get("counters").is_none() ||
-                mgr.table_index.get("counters").map(|m| m.is_empty()).unwrap_or(true));
+        assert!(
+            mgr.table_index.get("counters").is_none()
+                || mgr
+                    .table_index
+                    .get("counters")
+                    .map(|m| m.is_empty())
+                    .unwrap_or(true)
+        );
 
         let deltas = vec![make_delta("counters", "k", serde_json::json!({"v": 99}))];
         mgr.publish_deltas(&deltas);
@@ -682,12 +834,15 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Arc<Bytes>>();
         let cid = mgr.register_client(tx);
 
-        mgr.subscribe(cid, "s1".to_string(), "players".to_string()).unwrap();
-        mgr.subscribe(cid, "s2".to_string(), "counters".to_string()).unwrap();
+        mgr.subscribe(cid, "s1".to_string(), "players".to_string())
+            .unwrap();
+        mgr.subscribe(cid, "s2".to_string(), "counters".to_string())
+            .unwrap();
         mgr.unregister_client(cid);
 
         for table in &["players", "counters"] {
-            let absent = mgr.table_index
+            let absent = mgr
+                .table_index
                 .get(*table)
                 .map(|m| m.get(&cid).is_none())
                 .unwrap_or(true);
@@ -706,19 +861,21 @@ mod tests {
     fn reverse_index_correct_delivery_at_scale() {
         let mgr = SubscriptionManager::new();
 
-        let mut rxs_players  = Vec::new();
+        let mut rxs_players = Vec::new();
         let mut rxs_counters = Vec::new();
 
         for i in 0..25 {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Arc<Bytes>>();
             let cid = mgr.register_client(tx);
-            mgr.subscribe(cid, format!("ps_{}", i), "players".to_string()).unwrap();
+            mgr.subscribe(cid, format!("ps_{}", i), "players".to_string())
+                .unwrap();
             rxs_players.push(rx);
         }
         for i in 0..25 {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Arc<Bytes>>();
             let cid = mgr.register_client(tx);
-            mgr.subscribe(cid, format!("cs_{}", i), "counters".to_string()).unwrap();
+            mgr.subscribe(cid, format!("cs_{}", i), "counters".to_string())
+                .unwrap();
             rxs_counters.push(rx);
         }
 
@@ -726,10 +883,18 @@ mod tests {
         mgr.publish_deltas(&deltas);
 
         for (i, rx) in rxs_players.iter_mut().enumerate() {
-            assert!(rx.try_recv().is_ok(),  "players subscriber {} must receive", i);
+            assert!(
+                rx.try_recv().is_ok(),
+                "players subscriber {} must receive",
+                i
+            );
         }
         for (i, rx) in rxs_counters.iter_mut().enumerate() {
-            assert!(rx.try_recv().is_err(), "counters subscriber {} must NOT receive", i);
+            assert!(
+                rx.try_recv().is_err(),
+                "counters subscriber {} must NOT receive",
+                i
+            );
         }
     }
 
@@ -739,8 +904,10 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Arc<Bytes>>();
         let cid = mgr.register_client(tx);
 
-        mgr.subscribe(cid, "watch_players".to_string(),  "players".to_string()).unwrap();
-        mgr.subscribe(cid, "watch_counters".to_string(), "counters".to_string()).unwrap();
+        mgr.subscribe(cid, "watch_players".to_string(), "players".to_string())
+            .unwrap();
+        mgr.subscribe(cid, "watch_counters".to_string(), "counters".to_string())
+            .unwrap();
 
         let deltas = vec![make_delta("players", "hero", serde_json::json!({"hp": 75}))];
         mgr.publish_deltas(&deltas);
@@ -766,7 +933,7 @@ mod tests {
         let tables = Arc::new(TableStore::new());
         // Insert two counters before the client subscribes.
         tables.set_counter("alpha".to_string(), 10, 0).unwrap();
-        tables.set_counter("beta".to_string(),  20, 0).unwrap();
+        tables.set_counter("beta".to_string(), 20, 0).unwrap();
 
         let mgr = SubscriptionManager::new();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Arc<Bytes>>();
@@ -777,7 +944,8 @@ mod tests {
             "snap_all".to_string(),
             "counters".to_string(),
             Some(&tables),
-        ).unwrap();
+        )
+        .unwrap();
 
         // Should receive exactly 2 snapshot frames (one per existing row).
         let mut received = 0;
@@ -802,7 +970,7 @@ mod tests {
     #[test]
     fn initial_snapshot_respects_predicate() {
         let tables = Arc::new(TableStore::new());
-        tables.set_counter("low".to_string(),  5, 0).unwrap();
+        tables.set_counter("low".to_string(), 5, 0).unwrap();
         tables.set_counter("high".to_string(), 50, 0).unwrap();
 
         let mgr = SubscriptionManager::new();
@@ -815,14 +983,19 @@ mod tests {
             "snap_high".to_string(),
             "counters WHERE value > 10".to_string(),
             Some(&tables),
-        ).unwrap();
+        )
+        .unwrap();
 
         let mut received = 0;
         while let Ok(_) = rx.try_recv() {
             received += 1;
         }
         // Only "high" (value=50) matches value > 10
-        assert_eq!(received, 1, "expected 1 snapshot frame (only 'high' matches), got {}", received);
+        assert_eq!(
+            received, 1,
+            "expected 1 snapshot frame (only 'high' matches), got {}",
+            received
+        );
     }
 
     /// subscribe() without a table store must NOT send snapshot frames
@@ -832,7 +1005,190 @@ mod tests {
         let mgr = SubscriptionManager::new();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Arc<Bytes>>();
         let cid = mgr.register_client(tx);
-        mgr.subscribe(cid, "no_snap".to_string(), "counters".to_string()).unwrap();
-        assert!(rx.try_recv().is_err(), "no snapshot should be sent without tables");
+        mgr.subscribe(cid, "no_snap".to_string(), "counters".to_string())
+            .unwrap();
+        assert!(
+            rx.try_recv().is_err(),
+            "no snapshot should be sent without tables"
+        );
+    }
+
+    // ── TODO-004: IN operator ────────────────────────────────────────────────
+
+    #[test]
+    fn predicate_in_matches_member_value() {
+        let mgr = SubscriptionManager::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Arc<Bytes>>();
+        let cid = mgr.register_client(tx);
+        mgr.subscribe(
+            cid,
+            "s".to_string(),
+            "players WHERE status IN ('active', 'pending')".to_string(),
+        )
+        .unwrap();
+
+        // Matching delta (status = active)
+        let d = make_delta("players", "p1", serde_json::json!({"status": "active"}));
+        mgr.publish_deltas(&[d]);
+        assert!(rx.try_recv().is_ok(), "IN match should deliver");
+
+        // Non-matching delta (status = banned)
+        let d2 = make_delta("players", "p2", serde_json::json!({"status": "banned"}));
+        mgr.publish_deltas(&[d2]);
+        assert!(rx.try_recv().is_err(), "IN non-match should be filtered");
+    }
+
+    #[test]
+    fn predicate_in_with_numbers() {
+        let mgr = SubscriptionManager::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Arc<Bytes>>();
+        let cid = mgr.register_client(tx);
+        mgr.subscribe(
+            cid,
+            "s".to_string(),
+            "players WHERE level IN (1, 5, 10)".to_string(),
+        )
+        .unwrap();
+
+        let match_delta = make_delta("players", "p1", serde_json::json!({"level": 5}));
+        mgr.publish_deltas(&[match_delta]);
+        assert!(rx.try_recv().is_ok(), "level=5 should match IN (1,5,10)");
+
+        let no_match = make_delta("players", "p2", serde_json::json!({"level": 7}));
+        mgr.publish_deltas(&[no_match]);
+        assert!(
+            rx.try_recv().is_err(),
+            "level=7 should not match IN (1,5,10)"
+        );
+    }
+
+    // ── TODO-004: AND compound predicates ───────────────────────────────────
+
+    #[test]
+    fn predicate_and_both_must_match() {
+        let mgr = SubscriptionManager::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Arc<Bytes>>();
+        let cid = mgr.register_client(tx);
+        mgr.subscribe(
+            cid,
+            "s".to_string(),
+            "players WHERE score > 100 AND level > 5".to_string(),
+        )
+        .unwrap();
+
+        // Both conditions met → deliver
+        let both = make_delta(
+            "players",
+            "p1",
+            serde_json::json!({"score": 200, "level": 10}),
+        );
+        mgr.publish_deltas(&[both]);
+        assert!(rx.try_recv().is_ok(), "both conditions met should deliver");
+
+        // Only left condition met → filter
+        let only_left = make_delta(
+            "players",
+            "p2",
+            serde_json::json!({"score": 200, "level": 3}),
+        );
+        mgr.publish_deltas(&[only_left]);
+        assert!(
+            rx.try_recv().is_err(),
+            "only left condition should be filtered"
+        );
+
+        // Only right condition met → filter
+        let only_right = make_delta(
+            "players",
+            "p3",
+            serde_json::json!({"score": 50, "level": 10}),
+        );
+        mgr.publish_deltas(&[only_right]);
+        assert!(
+            rx.try_recv().is_err(),
+            "only right condition should be filtered"
+        );
+    }
+
+    #[test]
+    fn predicate_in_and_comparison_combined() {
+        let mgr = SubscriptionManager::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Arc<Bytes>>();
+        let cid = mgr.register_client(tx);
+        mgr.subscribe(
+            cid,
+            "s".to_string(),
+            "players WHERE status IN ('active', 'vip') AND score >= 50".to_string(),
+        )
+        .unwrap();
+
+        // status=active, score=100 → both match
+        let hit = make_delta(
+            "players",
+            "p1",
+            serde_json::json!({"status": "active", "score": 100}),
+        );
+        mgr.publish_deltas(&[hit]);
+        assert!(
+            rx.try_recv().is_ok(),
+            "status=active AND score=100 should deliver"
+        );
+
+        // status=vip, score=10 → only IN matches
+        let low_score = make_delta(
+            "players",
+            "p2",
+            serde_json::json!({"status": "vip", "score": 10}),
+        );
+        mgr.publish_deltas(&[low_score]);
+        assert!(
+            rx.try_recv().is_err(),
+            "status=vip but score=10 should be filtered"
+        );
+
+        // status=banned, score=200 → only comparison matches
+        let banned = make_delta(
+            "players",
+            "p3",
+            serde_json::json!({"status": "banned", "score": 200}),
+        );
+        mgr.publish_deltas(&[banned]);
+        assert!(rx.try_recv().is_err(), "status=banned should be filtered");
+    }
+
+    #[test]
+    fn parse_in_predicate_returns_correct_values() {
+        let filter =
+            parse_subscription_query("items WHERE rarity IN ('common', 'rare', 'epic')").unwrap();
+        assert_eq!(filter.table_name, "items");
+        match filter.predicate.unwrap() {
+            Predicate::In { field, values } => {
+                assert_eq!(field, "rarity");
+                assert_eq!(values.len(), 3);
+                assert!(values.contains(&Value::String("common".to_string())));
+                assert!(values.contains(&Value::String("rare".to_string())));
+                assert!(values.contains(&Value::String("epic".to_string())));
+            }
+            other => panic!("Expected In predicate, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_and_predicate_returns_compound() {
+        let filter = parse_subscription_query("players WHERE score > 100 AND level > 5").unwrap();
+        assert_eq!(filter.table_name, "players");
+        match filter.predicate.unwrap() {
+            Predicate::And(left, right) => {
+                match *left {
+                    Predicate::Comparison { field, .. } => assert_eq!(field, "score"),
+                    _ => panic!("expected Comparison on left"),
+                }
+                match *right {
+                    Predicate::Comparison { field, .. } => assert_eq!(field, "level"),
+                    _ => panic!("expected Comparison on right"),
+                }
+            }
+            other => panic!("Expected And predicate, got {:?}", other),
+        }
     }
 }

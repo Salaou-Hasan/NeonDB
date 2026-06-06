@@ -32,6 +32,7 @@ pub struct PendingCall {
     pub call_id: u64,
     pub reducer_name: String,
     pub args: Vec<u8>,
+    pub caller_id: String,
     pub response_tx: mpsc::UnboundedSender<ReducerResponse>,
 }
 
@@ -79,7 +80,7 @@ pub async fn start_listener(
                         let conns   = active_connections.clone();
 
                         tokio::spawn(async move {
-                            if let Err(e) = handle_client(stream, tx, subs, tbl, api_key, conns).await {
+                            if let Err(e) = handle_client(stream, tx, subs, tbl, api_key, conns, peer_addr.to_string()).await {
                                 log::warn!("Client error: {}", e);
                             }
                         });
@@ -103,8 +104,13 @@ async fn handle_client(
     tables: Arc<TableStore>,
     api_key: Option<String>,
     active_connections: Arc<AtomicUsize>,
+    peer_addr: String,
 ) -> Result<()> {
     // ── WebSocket handshake with optional Bearer auth ─────────────────────────
+    // Capture the X-NeonDB-Identity header value from the upgrade request.
+    let caller_id_cell = Arc::new(std::sync::Mutex::new(String::new()));
+    let caller_id_capture = caller_id_cell.clone();
+
     let auth_key = api_key.clone();
     let ws_stream = tokio_tungstenite::accept_hdr_async(
         stream,
@@ -119,11 +125,32 @@ async fn handle_client(
                     return Err(ErrorResponse::new(Some("Unauthorized".to_string())));
                 }
             }
+            // Extract per-connection identity from the X-NeonDB-Identity header.
+            // Falls back to the TCP peer address if not provided.
+            if let Some(id) = request
+                .headers()
+                .get("x-neondb-identity")
+                .and_then(|v| v.to_str().ok())
+            {
+                if let Ok(mut cell) = caller_id_capture.lock() {
+                    *cell = id.to_string();
+                }
+            }
             Ok(response)
         },
     )
     .await
     .map_err(|e| NeonDBError::network_error(format!("WebSocket handshake error: {}", e)))?;
+
+    // Resolve caller_id: X-NeonDB-Identity header if supplied, else TCP peer address.
+    let caller_id: String = {
+        let guard = caller_id_cell.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_empty() {
+            peer_addr.clone()
+        } else {
+            guard.clone()
+        }
+    };
 
     let _conn_guard = ConnectionGuard(active_connections.clone());
     let current = active_connections.fetch_add(1, Ordering::SeqCst);
@@ -181,13 +208,17 @@ async fn handle_client(
                             call_id: call.call_id,
                             reducer_name: call.reducer_name,
                             args: call.args,
+                            caller_id: caller_id.clone(),
                             response_tx: response_tx.clone(),
                         };
                         if let Err(e) = reducer_tx.send(pending).await {
                             log::warn!("Reducer queue send failed: {}", e);
                         }
                     }
-                    Ok(ClientMessage::Subscribe { subscription_id, query }) => {
+                    Ok(ClientMessage::Subscribe {
+                        subscription_id,
+                        query,
+                    }) => {
                         // TODO-003: pass the live TableStore so the subscriber
                         // immediately receives all currently matching rows as
                         // "initial_snapshot" frames before any future deltas.
@@ -214,8 +245,7 @@ async fn handle_client(
                         }
                     }
                     Ok(ClientMessage::Unsubscribe { subscription_id }) => {
-                        let result =
-                            subscription_manager.unsubscribe(client_id, &subscription_id);
+                        let result = subscription_manager.unsubscribe(client_id, &subscription_id);
                         let ack = match result {
                             Ok(true) => ServerMessage::SubscriptionAck {
                                 subscription_id,
@@ -243,6 +273,7 @@ async fn handle_client(
                                 call_id: call.call_id,
                                 reducer_name: call.reducer_name,
                                 args: call.args,
+                                caller_id: caller_id.clone(),
                                 response_tx: response_tx.clone(),
                             };
                             if let Err(e) = reducer_tx.send(pending).await {
@@ -294,6 +325,7 @@ mod tests {
             call_id: 1,
             reducer_name: "increment".to_string(),
             args: vec![],
+            caller_id: String::new(),
             response_tx: _tx,
         };
         assert_eq!(call.call_id, 1);

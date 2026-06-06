@@ -30,6 +30,11 @@ This document explains how to deploy NeonDB locally or in a containerized enviro
 - `NEONDB_API_KEY`: Optional API key required by WebSocket clients
 - `RUST_LOG`: Logging level (`info` by default)
 
+### Snapshot Configuration
+
+- `NEONDB_SNAPSHOT_INTERVAL`: Transactions between automatic snapshots (`1000000` by default). Set to `0` to disable.
+- `NEONDB_SNAPSHOT_DIR`: Directory for snapshot files (`/tmp/neondb_snapshots` by default — override in production)
+
 ## Local deployment
 
 Build and run the server locally:
@@ -98,50 +103,31 @@ Stop:
 docker-compose down
 ```
 
-## Coolify Deployment
+## Dokploy Deployment
 
 ### Prerequisites
 
-- Coolify instance running and accessible
-- Docker and docker-compose support enabled
-- Access to your NeonDB Docker image (push to registry or local build)
+- Dokploy instance running and accessible (install: `curl -sSL https://dokploy.com/install.sh | sh`)
+- VPS with Docker (configured automatically by Dokploy installer)
+- Optional: domain pointed at your VPS for TLS
 
-### Setup Steps
+### Deployment Steps
 
-1. **Add new application** in Coolify → Select "Docker Compose"
+1. **Create a project** in Dokploy dashboard → **Projects** → **Create Project**
 
-2. **Paste compose file**:
-   ```yaml
-   version: '3.8'
-   services:
-     neondb:
-       image: neondb:latest
-       ports:
-         - "8000:8000"
-         - "8001:8001"
-       environment:
-         NEONDB_HOST: "0.0.0.0"
-         NEONDB_PORT: "8000"
-         NEONDB_METRICS_PORT: "8001"
-         NEONDB_WAL_BATCH_SIZE: "100000"
-         NEONDB_WAL_BATCH_INTERVAL_MS: "100"
-         NEONDB_UNSAFE_NO_FSYNC: "false"
-       volumes:
-         - neondb-data:/data/wal
-       healthcheck:
-         test: ["CMD", "nc", "-z", "localhost", "8000"]
-         interval: 10s
-         timeout: 5s
-         retries: 5
-   
-   volumes:
-     neondb-data:
-       driver: local
-   ```
+2. **Add service** → **Application** → connect your Git repo → Build Type: `Dockerfile`
 
-3. **Configure environment** as needed for your deployment
+3. **Configure environment variables** (see list below) in the service **Environment** tab
 
-4. **Deploy** and monitor health checks
+4. **Add volume mounts** in the **Mounts** tab:
+   - `neondb-wal` → `/data/wal`
+   - `neondb-snapshots` → `/data/snapshots`
+
+5. **Configure domain / TLS** in the **Domains** tab (optional — auto TLS via Traefik)
+
+6. **Deploy** — monitor in the **Deployments** tab
+
+See `DOKPLOY_DEPLOYMENT.md` for the full step-by-step guide and Docker Compose option.
 
 ### Health Check Endpoint
 

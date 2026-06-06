@@ -143,7 +143,11 @@ impl BlobStore {
             .read(true)
             .open(&path)?;
         let next_offset = file.seek(SeekFrom::End(0))?;
-        Ok(BlobStore { path, file, next_offset })
+        Ok(BlobStore {
+            path,
+            file,
+            next_offset,
+        })
     }
 
     fn store_blob(&mut self, payload: &[u8]) -> Result<u64> {
@@ -167,6 +171,53 @@ impl BlobStore {
     }
 }
 
+// ── Secondary field index ─────────────────────────────────────────────────────
+
+/// A single-field secondary index: maps serialised field values to the set of
+/// row keys that carry that value.
+///
+/// The inner `DashMap<String, ()>` is used as a concurrent set — presence of
+/// a key means the row exists; there is no meaningful value.
+struct FieldIndex {
+    /// `field_value_as_string → DashMap<row_key, ()>`
+    buckets: DashMap<String, DashMap<String, ()>>,
+}
+
+impl FieldIndex {
+    fn new() -> Self {
+        FieldIndex {
+            buckets: DashMap::with_capacity_and_shard_amount(64, 16),
+        }
+    }
+
+    /// Add `row_key` to the bucket for `field_value`.
+    fn insert(&self, field_value: &str, row_key: &str) {
+        self.buckets
+            .entry(field_value.to_string())
+            .or_insert_with(|| DashMap::with_capacity_and_shard_amount(16, 4))
+            .insert(row_key.to_string(), ());
+    }
+
+    /// Remove `row_key` from the bucket for `field_value`.
+    /// Drops the bucket entirely if it becomes empty.
+    fn remove(&self, field_value: &str, row_key: &str) {
+        if let Some(bucket) = self.buckets.get(field_value) {
+            bucket.remove(row_key);
+        }
+        // Drop the outer bucket if it is now empty.
+        self.buckets
+            .remove_if(field_value, |_, bucket| bucket.is_empty());
+    }
+
+    /// Return all row keys whose indexed field equals `field_value`.
+    fn lookup(&self, field_value: &str) -> Vec<String> {
+        match self.buckets.get(field_value) {
+            None => vec![],
+            Some(bucket) => bucket.iter().map(|e| e.key().clone()).collect(),
+        }
+    }
+}
+
 // ── Per-table shard ───────────────────────────────────────────────────────────
 
 struct Table {
@@ -174,6 +225,8 @@ struct Table {
     /// Per-row-key write locks.  Acquired in sorted key order inside
     /// apply_delta_batch() to prevent deadlocks.  Reads are lock-free.
     row_locks: DashMap<String, Arc<Mutex<()>>>,
+    /// Secondary field indexes: indexed_field_name → FieldIndex.
+    field_indexes: DashMap<String, Arc<FieldIndex>>,
 }
 
 impl Table {
@@ -182,6 +235,7 @@ impl Table {
         Table {
             rows: DashMap::with_capacity_and_shard_amount(256, shards),
             row_locks: DashMap::with_capacity_and_shard_amount(256, shards),
+            field_indexes: DashMap::new(),
         }
     }
 
@@ -314,6 +368,16 @@ impl TableStore {
             ("insert".to_string(), self.alloc_row_id())
         };
 
+        // Capture the old row data for index maintenance (before overwriting).
+        let old_row_value: Option<Value> = if operation == "update" {
+            table
+                .rows
+                .get(key)
+                .and_then(|r| serde_json::from_slice::<Value>(&r.data).ok())
+        } else {
+            None
+        };
+
         let (final_value, blob_offset) = self.prepare_value(table_name, key, value)?;
 
         let encoded = serde_json::to_vec(&final_value)
@@ -327,6 +391,22 @@ impl TableStore {
             blob_offset,
         };
         table.rows.insert(key.to_string(), stored);
+
+        // ── Maintain secondary indexes ─────────────────────────────────────────
+        for idx_entry in table.field_indexes.iter() {
+            let field = idx_entry.key();
+            let idx = idx_entry.value().clone();
+            // Remove old field value from index (update case).
+            if let Some(old_val) = &old_row_value {
+                if let Some(old_fv) = old_val.get(field).and_then(value_to_index_key) {
+                    idx.remove(&old_fv, key);
+                }
+            }
+            // Add new field value to index.
+            if let Some(new_fv) = final_value.get(field).and_then(value_to_index_key) {
+                idx.insert(&new_fv, key);
+            }
+        }
 
         Ok(RowDelta {
             table_name: table_name.to_string(),
@@ -348,6 +428,18 @@ impl TableStore {
             .and_then(|t| t.rows.get(key).map(|r| r.row_id))
             .unwrap_or(0);
         if let Some(table) = self.tables.get(table_name) {
+            // Remove from secondary indexes before deleting the row.
+            if let Some(old_row) = table.rows.get(key) {
+                if let Ok(old_val) = serde_json::from_slice::<Value>(&old_row.data) {
+                    for idx_entry in table.field_indexes.iter() {
+                        let field = idx_entry.key();
+                        let idx = idx_entry.value().clone();
+                        if let Some(fv) = old_val.get(field).and_then(value_to_index_key) {
+                            idx.remove(&fv, key);
+                        }
+                    }
+                }
+            }
             table.rows.remove(key);
         }
         Ok(RowDelta {
@@ -427,11 +519,9 @@ impl TableStore {
 
             let result: Result<RowDelta> = match delta.operation.as_str() {
                 "insert" | "update" => {
-                    let value = delta
-                        .row_data_value()
-                        .ok_or_else(|| NeonDBError::table_error(
-                            "insert/update delta missing row_data",
-                        ))?;
+                    let value = delta.row_data_value().ok_or_else(|| {
+                        NeonDBError::table_error("insert/update delta missing row_data")
+                    })?;
                     let old = self
                         .tables
                         .get(&delta.table_name)
@@ -454,10 +544,7 @@ impl TableStore {
                 // data race outside the lock window.
                 "counter_add" => {
                     let name = &delta.row_key;
-                    let current_val = self
-                        .get_counter(name)?
-                        .map(|c| c.value)
-                        .unwrap_or(0);
+                    let current_val = self.get_counter(name)?.map(|c| c.value).unwrap_or(0);
                     let new_val = current_val + delta.counter_add_amount;
 
                     // Preserve existing row_id if the row already exists.
@@ -482,7 +569,10 @@ impl TableStore {
                     applied.push((delta.table_name.clone(), delta.row_key.clone(), old));
                     self.write_row_unlocked(&delta.table_name, name, value)
                 }
-                other => Err(NeonDBError::table_error(format!("Unknown operation: {}", other))),
+                other => Err(NeonDBError::table_error(format!(
+                    "Unknown operation: {}",
+                    other
+                ))),
             };
 
             match result {
@@ -492,8 +582,12 @@ impl TableStore {
                     for (tbl, key, old_row) in applied.into_iter().rev() {
                         if let Some(table) = self.tables.get(&tbl) {
                             match old_row {
-                                Some(row) => { table.rows.insert(key, row); }
-                                None      => { table.rows.remove(&key); }
+                                Some(row) => {
+                                    table.rows.insert(key, row);
+                                }
+                                None => {
+                                    table.rows.remove(&key);
+                                }
                             }
                         }
                     }
@@ -507,7 +601,8 @@ impl TableStore {
 
     /// Legacy single-delta path — used by WAL replay and convenience tests.
     pub fn apply_delta(&self, delta: &RowDelta) -> Result<()> {
-        self.apply_delta_batch(std::slice::from_ref(delta)).map(|_| ())
+        self.apply_delta_batch(std::slice::from_ref(delta))
+            .map(|_| ())
     }
 
     // ── Blob helpers ─────────────────────────────────────────────────────────
@@ -538,10 +633,7 @@ impl TableStore {
         }
         if table_name == "players" {
             if let Some(obj) = value.as_object_mut() {
-                obj.insert(
-                    "shard_id".to_string(),
-                    Value::Number(self.shard_id.into()),
-                );
+                obj.insert("shard_id".to_string(), Value::Number(self.shard_id.into()));
             }
         }
         if let Some(obj) = value.as_object_mut() {
@@ -555,9 +647,7 @@ impl TableStore {
     pub fn get_counter(&self, name: &str) -> Result<Option<Counter>> {
         if let Some(value) = self.get_row("counters", name)? {
             let counter: Counter = serde_json::from_value(value)
-                .map_err(|e| NeonDBError::SerializationError(
-                    format!("Counter decode: {}", e),
-                ))?;
+                .map_err(|e| NeonDBError::SerializationError(format!("Counter decode: {}", e)))?;
             Ok(Some(counter))
         } else {
             Ok(None)
@@ -569,19 +659,13 @@ impl TableStore {
         values
             .into_iter()
             .map(|v| {
-                serde_json::from_value(v).map_err(|e| {
-                    NeonDBError::SerializationError(format!("Counter decode: {}", e))
-                })
+                serde_json::from_value(v)
+                    .map_err(|e| NeonDBError::SerializationError(format!("Counter decode: {}", e)))
             })
             .collect()
     }
 
-    pub fn set_counter(
-        &self,
-        name: String,
-        value: i32,
-        last_modified: i64,
-    ) -> Result<RowDelta> {
+    pub fn set_counter(&self, name: String, value: i32, last_modified: i64) -> Result<RowDelta> {
         let existing = self.get_counter(&name)?;
         let row_id = existing
             .map(|c| c.id)
@@ -592,15 +676,131 @@ impl TableStore {
             value,
             last_modified,
         };
-        self.set_row(
-            "counters".to_string(),
-            name,
-            serde_json::to_value(counter)?,
-        )
+        self.set_row("counters".to_string(), name, serde_json::to_value(counter)?)
     }
 
     pub fn delete_counter(&self, name: &str) -> Result<RowDelta> {
         self.delete_row("counters", name)
+    }
+
+    // ── Secondary index API ──────────────────────────────────────────────────
+
+    /// Register a hash index on `field` for `table_name`.
+    ///
+    /// If the table already contains rows, the index is built immediately by
+    /// scanning all existing rows.  Idempotent: calling twice for the same
+    /// (table, field) pair is a no-op.
+    pub fn create_index(&self, table_name: &str, field: &str) -> Result<()> {
+        let table = self.get_or_create_table(table_name);
+
+        // Idempotent — if index already exists, nothing to do.
+        if table.field_indexes.contains_key(field) {
+            return Ok(());
+        }
+
+        let idx = Arc::new(FieldIndex::new());
+
+        // Back-fill: index all rows that already exist.
+        for entry in table.rows.iter() {
+            let row_key = entry.key();
+            let row = entry.value();
+            if let Ok(value) = serde_json::from_slice::<Value>(&row.data) {
+                if let Some(fv) = value.get(field).and_then(value_to_index_key) {
+                    idx.insert(&fv, row_key);
+                }
+            }
+        }
+
+        table.field_indexes.insert(field.to_string(), idx);
+        Ok(())
+    }
+
+    /// Drop the secondary index on `field` for `table_name`.
+    /// No-op if no such index exists.
+    pub fn drop_index(&self, table_name: &str, field: &str) {
+        if let Some(table) = self.tables.get(table_name) {
+            table.field_indexes.remove(field);
+        }
+    }
+
+    /// Return the row keys of all rows in `table_name` where `field == value`.
+    ///
+    /// Returns `None` if no index exists for this field — the caller should
+    /// fall back to a full scan.  Returns `Some(Vec)` (possibly empty) when
+    /// the index is present.
+    pub fn index_lookup(
+        &self,
+        table_name: &str,
+        field: &str,
+        value: &Value,
+    ) -> Option<Vec<String>> {
+        let table = self.tables.get(table_name)?;
+        let idx = table.field_indexes.get(field)?;
+        let fv = value_to_index_key(value)?;
+        Some(idx.lookup(&fv))
+    }
+
+    /// List all fields that have a registered secondary index for `table_name`.
+    pub fn list_indexes(&self, table_name: &str) -> Vec<String> {
+        match self.tables.get(table_name) {
+            None => vec![],
+            Some(t) => t.field_indexes.iter().map(|e| e.key().clone()).collect(),
+        }
+    }
+
+    // ── Snapshot helpers ─────────────────────────────────────────────────────────
+
+    /// Return all table names currently in the store.
+    pub fn list_tables(&self) -> Vec<String> {
+        self.tables.iter().map(|e| e.key().clone()).collect()
+    }
+
+    /// Return all rows in `table_name` as (row_key, decoded_value) pairs.
+    /// Includes blob data if present. Respects shard filter.
+    pub fn list_rows_with_keys(&self, table_name: &str) -> Result<Vec<(String, Value)>> {
+        let table = match self.tables.get(table_name) {
+            Some(t) => t.clone(),
+            None => return Ok(vec![]),
+        };
+        let mut rows = Vec::with_capacity(table.rows.len());
+        for entry in table.rows.iter() {
+            let key = entry.key().clone();
+            let row = entry.value();
+            if !self.row_matches_shard(row.shard_id) {
+                continue;
+            }
+            let mut value = Self::decode_row(row)?;
+            if let Some(offset) = row.blob_offset {
+                self.load_blob_into_value(&mut value, offset)?;
+            }
+            rows.push((key, value));
+        }
+        Ok(rows)
+    }
+
+    /// Return the current value of the next-row-ID counter.
+    /// Used by snapshots to preserve ID continuity across restarts.
+    pub fn current_next_row_id(&self) -> u32 {
+        self.next_row_id.load(Ordering::SeqCst)
+    }
+
+    /// Overwrite the next-row-ID counter.
+    /// Called after restoring a snapshot to prevent ID collisions with
+    /// rows whose IDs are embedded in WAL entries that post-date the snapshot.
+    pub fn set_next_row_id(&self, next_id: u32) {
+        self.next_row_id.store(next_id, Ordering::SeqCst);
+    }
+}
+
+/// Convert a JSON Value to the canonical string key used inside a FieldIndex.
+/// Returns `None` for `Null` (nulls are not indexed).
+fn value_to_index_key(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        Value::Bool(b) => Some(b.to_string()),
+        Value::Null => None,
+        other => Some(serde_json::to_string(other).unwrap_or_default()),
     }
 }
 
@@ -751,9 +951,11 @@ mod tests {
 
         let final_val = tables.get_counter("shared").unwrap().unwrap().value;
         assert_eq!(
-            final_val, (iters * 2) as i32,
+            final_val,
+            (iters * 2) as i32,
             "Expected {} but got {} — lost update detected",
-            iters * 2, final_val
+            iters * 2,
+            final_val
         );
     }
 
@@ -821,5 +1023,148 @@ mod tests {
         };
         s.apply_delta_batch(&[delta]).unwrap();
         assert_eq!(s.get_counter("pts").unwrap().unwrap().value, 15);
+    }
+
+    // ── Secondary index tests ────────────────────────────────────────────────
+
+    #[test]
+    fn test_index_lookup_basic() {
+        let ts = Arc::new(TableStore::new());
+        ts.create_index("players", "status").unwrap();
+
+        ts.set_row(
+            "players".to_string(),
+            "p1".to_string(),
+            serde_json::json!({"status": "active", "level": 5}),
+        )
+        .unwrap();
+        ts.set_row(
+            "players".to_string(),
+            "p2".to_string(),
+            serde_json::json!({"status": "inactive", "level": 3}),
+        )
+        .unwrap();
+        ts.set_row(
+            "players".to_string(),
+            "p3".to_string(),
+            serde_json::json!({"status": "active", "level": 10}),
+        )
+        .unwrap();
+
+        let active = ts
+            .index_lookup("players", "status", &serde_json::json!("active"))
+            .expect("index should exist");
+        assert_eq!(active.len(), 2, "two active players");
+        assert!(active.contains(&"p1".to_string()));
+        assert!(active.contains(&"p3".to_string()));
+
+        let inactive = ts
+            .index_lookup("players", "status", &serde_json::json!("inactive"))
+            .expect("index should exist");
+        assert_eq!(inactive.len(), 1);
+        assert!(inactive.contains(&"p2".to_string()));
+    }
+
+    #[test]
+    fn test_index_returns_none_without_index() {
+        let ts = Arc::new(TableStore::new());
+        ts.set_row(
+            "items".to_string(),
+            "i1".to_string(),
+            serde_json::json!({"rarity": "common"}),
+        )
+        .unwrap();
+
+        // No index created → should return None
+        let result = ts.index_lookup("items", "rarity", &serde_json::json!("common"));
+        assert!(
+            result.is_none(),
+            "should return None without a registered index"
+        );
+    }
+
+    #[test]
+    fn test_index_maintained_on_update() {
+        let ts = Arc::new(TableStore::new());
+        ts.create_index("players", "status").unwrap();
+
+        ts.set_row(
+            "players".to_string(),
+            "p1".to_string(),
+            serde_json::json!({"status": "active"}),
+        )
+        .unwrap();
+
+        // Update: change status from active → inactive
+        ts.set_row(
+            "players".to_string(),
+            "p1".to_string(),
+            serde_json::json!({"status": "inactive"}),
+        )
+        .unwrap();
+
+        let active = ts
+            .index_lookup("players", "status", &serde_json::json!("active"))
+            .unwrap();
+        assert!(active.is_empty(), "old bucket should be empty after update");
+
+        let inactive = ts
+            .index_lookup("players", "status", &serde_json::json!("inactive"))
+            .unwrap();
+        assert_eq!(inactive.len(), 1);
+        assert!(inactive.contains(&"p1".to_string()));
+    }
+
+    #[test]
+    fn test_index_maintained_on_delete() {
+        let ts = Arc::new(TableStore::new());
+        ts.create_index("players", "status").unwrap();
+
+        ts.set_row(
+            "players".to_string(),
+            "p1".to_string(),
+            serde_json::json!({"status": "active"}),
+        )
+        .unwrap();
+
+        ts.delete_row("players", "p1").unwrap();
+
+        let active = ts
+            .index_lookup("players", "status", &serde_json::json!("active"))
+            .unwrap();
+        assert!(
+            active.is_empty(),
+            "deleted row should be removed from index"
+        );
+    }
+
+    #[test]
+    fn test_create_index_backfills_existing_rows() {
+        let ts = Arc::new(TableStore::new());
+        // Insert rows BEFORE creating the index
+        ts.set_row(
+            "players".to_string(),
+            "p1".to_string(),
+            serde_json::json!({"status": "active"}),
+        )
+        .unwrap();
+        ts.set_row(
+            "players".to_string(),
+            "p2".to_string(),
+            serde_json::json!({"status": "active"}),
+        )
+        .unwrap();
+
+        // Create index after rows exist
+        ts.create_index("players", "status").unwrap();
+
+        let active = ts
+            .index_lookup("players", "status", &serde_json::json!("active"))
+            .expect("index should exist");
+        assert_eq!(
+            active.len(),
+            2,
+            "back-fill should index both pre-existing rows"
+        );
     }
 }

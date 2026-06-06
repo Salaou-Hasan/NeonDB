@@ -2,13 +2,13 @@
 
 **Date**: December 2024  
 **Status**: ✅ READY FOR PRODUCTION DEPLOYMENT  
-**Deployment Target**: Coolify
+**Deployment Target**: Dokploy
 
 ---
 
 ## Executive Summary
 
-NeonDB has been fully optimized with enterprise-grade features and is ready for immediate production deployment to Coolify. All optimizations are complete, tested, and documented.
+NeonDB has been fully optimized with enterprise-grade features and is ready for immediate production deployment to Dokploy. All optimizations are complete, tested, and documented.
 
 ## Completed Optimizations
 
@@ -123,12 +123,12 @@ NeonDB has been fully optimized with enterprise-grade features and is ready for 
 ✅ DEPLOYMENT.md
    - Comprehensive deployment guide
    - Environment variable documentation
-   - Coolify-specific instructions
+   - Dokploy-specific instructions
    - Sharding examples
    - Troubleshooting guide
 
-✅ COOLIFY_DEPLOYMENT.md (NEW)
-   - Coolify-specific deployment guide
+✅ DOKPLOY_DEPLOYMENT.md (NEW)
+   - Dokploy-specific deployment guide
    - 3 deployment options
    - Performance tuning for different scenarios
    - Monitoring and health check configuration
@@ -137,7 +137,7 @@ NeonDB has been fully optimized with enterprise-grade features and is ready for 
 
 ### Test Coverage
 ```
-✅ 25 Unit Tests Passing (100%)
+✅ 79 Unit Tests Passing (100%)
 
 src/table/mod.rs:
   - test_insert_and_get: Insert, retrieve, verify blob storage
@@ -190,7 +190,7 @@ All other unit tests passing (increments, deletions, utils, etc.)
 ✅ Binary: target/release/neondb.exe (3.73 MB)
 ✅ Dockerfile: Ready for multi-stage Docker build
 ✅ docker-compose.yml: Production-grade composition
-✅ Deployment guides: DEPLOYMENT.md, COOLIFY_DEPLOYMENT.md
+✅ Deployment guides: DEPLOYMENT.md, DOKPLOY_DEPLOYMENT.md
 ✅ Configuration: neondb.toml (example)
 ✅ Source code: src/main.rs, all modules
 ```
@@ -291,26 +291,20 @@ Startup: 5 seconds
 
 ---
 
-## Coolify Deployment Options
+## Dokploy Deployment Options
 
-### Option 1: Pre-built Binary
-- Copy compiled binary to Linux server
-- Configure environment variables
-- Run directly
-- ✅ Fastest, ❌ No containerization benefits
+### Option 1: Git-Connected Build (Recommended) ✅
+- Connect NeonDB repository to Dokploy
+- Dokploy builds from `Dockerfile` automatically on each push
+- Configure env vars and volume mounts in the dashboard
+- Auto TLS via Traefik when a domain is configured
 
-### Option 2: Docker Compose (Recommended) ✅
-- Use Coolify's Docker Compose support
-- Upload `docker-compose.yml`
-- Configure environment variables in Coolify dashboard
-- Deploy with one click
-- ✅ Containerized, persistent volumes, easy monitoring
+### Option 2: Docker Compose ✅
+- Use Dokploy's Docker Compose service type
+- Upload or paste `docker-compose.yml` from this repository
+- Uncomment Traefik labels for domain-based routing
 
-### Option 3: Sharded Multi-Node
-- Deploy 3+ instances with different SHARD_ID values
-- Add load balancer (HAProxy, Nginx)
-- Each node processes its shard
-- ✅ Horizontal scaling, high availability
+See `DOKPLOY_DEPLOYMENT.md` for full instructions.
 
 ---
 
@@ -320,7 +314,7 @@ Startup: 5 seconds
 ```bash
 # 1. Build and test locally
 cargo build --release      # ✅ Success: 3.73 MB binary
-cargo test --lib           # ✅ Success: 25/25 tests
+cargo test --lib           # ✅ Success: 79/79 tests
 
 # 2. Run server
 ./target/release/neondb.exe
@@ -429,35 +423,29 @@ curl http://localhost:8001/metrics   # Prometheus metrics
 
 ## Deployment Instructions
 
-### For Coolify Administrator
+### For Dokploy Administrator
 
-1. **Access Coolify Dashboard**
-   - Navigate to Applications → Add Application
-   - Select "Docker Compose"
+1. **Access Dokploy Dashboard**
+   - Navigate to Projects → Add Service → Application
 
-2. **Upload Configuration**
-   - Paste contents of `docker-compose.yml`
-   - Or reference git repository
+2. **Connect Repository**
+   - Link Git provider and select the NeonDB repository
+   - Set Build Type: Dockerfile
 
 3. **Set Environment Variables**
-   - Copy variables from `COOLIFY_DEPLOYMENT.md`
+   - Copy variables from `DOKPLOY_DEPLOYMENT.md`
    - Set `NEONDB_WAL_PATH=/data/wal/neondb.wal`
-   - All other variables have sensible defaults
+   - Set `NEONDB_SNAPSHOT_DIR=/data/snapshots`
+   - Optionally set `NEONDB_API_KEY` for access control
 
 4. **Configure Storage**
-   - Create persistent volume: `neondb-data`
-   - Mount path: `/data/wal`
+   - Add volume mount: `neondb-wal` → `/data/wal`
+   - Add volume mount: `neondb-snapshots` → `/data/snapshots`
 
-5. **Deploy**
-   - Click "Deploy"
-   - Monitor logs for "Starting NeonDB Server"
-   - Verify health status changes to "Healthy"
+5. **Configure Domain (optional)**
+   - Add domain in Domains tab for auto-TLS via Traefik
 
-6. **Test**
-   ```bash
-   curl http://<coolify-host>:8000/  # Should attempt WebSocket upgrade
-   curl http://<coolify-host>:8001/metrics  # Should return metrics
-   ```
+6. **Deploy and Verify**
 
 ---
 
@@ -469,8 +457,8 @@ curl http://localhost:8001/metrics   # Prometheus metrics
 - Scale horizontally by adding shards if needed
 
 **If issues encountered:**
-- Check `COOLIFY_DEPLOYMENT.md` troubleshooting section
-- Review application logs via Coolify dashboard
+- Check `DOKPLOY_DEPLOYMENT.md` troubleshooting section
+   - Review application logs via Dokploy dashboard
 - Verify environment variables are set correctly
 - Ensure volume mount is writable by container
 
@@ -483,7 +471,7 @@ curl http://localhost:8001/metrics   # Prometheus metrics
 ---
 
 **Status**: ✅ **READY FOR PRODUCTION**  
-**Next Action**: Deploy to Coolify  
+**Next Action**: Deploy to Dokploy
 **Estimated Deployment Time**: 5-10 minutes  
 **Expected Availability**: 99.9%
 
