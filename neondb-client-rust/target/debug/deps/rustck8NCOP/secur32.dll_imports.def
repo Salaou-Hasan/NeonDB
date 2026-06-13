@@ -1,8 +1,0 @@
-EXPORTS
-ApplyControlToken
-CompleteAuthToken
-ExportSecurityContext
-MakeSignature
-QuerySecurityContextToken
-SetContextAttributesW
-VerifySignature
