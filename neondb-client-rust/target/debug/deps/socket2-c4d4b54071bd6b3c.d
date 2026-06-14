@@ -1,0 +1,11 @@
+C:\Users\King\Desktop\NeonDB\neondb-client-rust\target\debug\deps\socket2-c4d4b54071bd6b3c.d: C:\Users\King\.cargo\registry\src\mirrors.ustc.edu.cn-38d0e5eb5da2abae\socket2-0.6.4\src\lib.rs C:\Users\King\.cargo\registry\src\mirrors.ustc.edu.cn-38d0e5eb5da2abae\socket2-0.6.4\src\sockaddr.rs C:\Users\King\.cargo\registry\src\mirrors.ustc.edu.cn-38d0e5eb5da2abae\socket2-0.6.4\src\socket.rs C:\Users\King\.cargo\registry\src\mirrors.ustc.edu.cn-38d0e5eb5da2abae\socket2-0.6.4\src\sockref.rs C:\Users\King\.cargo\registry\src\mirrors.ustc.edu.cn-38d0e5eb5da2abae\socket2-0.6.4\src\sys\windows.rs
+
+C:\Users\King\Desktop\NeonDB\neondb-client-rust\target\debug\deps\libsocket2-c4d4b54071bd6b3c.rlib: C:\Users\King\.cargo\registry\src\mirrors.ustc.edu.cn-38d0e5eb5da2abae\socket2-0.6.4\src\lib.rs C:\Users\King\.cargo\registry\src\mirrors.ustc.edu.cn-38d0e5eb5da2abae\socket2-0.6.4\src\sockaddr.rs C:\Users\King\.cargo\registry\src\mirrors.ustc.edu.cn-38d0e5eb5da2abae\socket2-0.6.4\src\socket.rs C:\Users\King\.cargo\registry\src\mirrors.ustc.edu.cn-38d0e5eb5da2abae\socket2-0.6.4\src\sockref.rs C:\Users\King\.cargo\registry\src\mirrors.ustc.edu.cn-38d0e5eb5da2abae\socket2-0.6.4\src\sys\windows.rs
+
+C:\Users\King\Desktop\NeonDB\neondb-client-rust\target\debug\deps\libsocket2-c4d4b54071bd6b3c.rmeta: C:\Users\King\.cargo\registry\src\mirrors.ustc.edu.cn-38d0e5eb5da2abae\socket2-0.6.4\src\lib.rs C:\Users\King\.cargo\registry\src\mirrors.ustc.edu.cn-38d0e5eb5da2abae\socket2-0.6.4\src\sockaddr.rs C:\Users\King\.cargo\registry\src\mirrors.ustc.edu.cn-38d0e5eb5da2abae\socket2-0.6.4\src\socket.rs C:\Users\King\.cargo\registry\src\mirrors.ustc.edu.cn-38d0e5eb5da2abae\socket2-0.6.4\src\sockref.rs C:\Users\King\.cargo\registry\src\mirrors.ustc.edu.cn-38d0e5eb5da2abae\socket2-0.6.4\src\sys\windows.rs
+
+C:\Users\King\.cargo\registry\src\mirrors.ustc.edu.cn-38d0e5eb5da2abae\socket2-0.6.4\src\lib.rs:
+C:\Users\King\.cargo\registry\src\mirrors.ustc.edu.cn-38d0e5eb5da2abae\socket2-0.6.4\src\sockaddr.rs:
+C:\Users\King\.cargo\registry\src\mirrors.ustc.edu.cn-38d0e5eb5da2abae\socket2-0.6.4\src\socket.rs:
+C:\Users\King\.cargo\registry\src\mirrors.ustc.edu.cn-38d0e5eb5da2abae\socket2-0.6.4\src\sockref.rs:
+C:\Users\King\.cargo\registry\src\mirrors.ustc.edu.cn-38d0e5eb5da2abae\socket2-0.6.4\src\sys\windows.rs:
