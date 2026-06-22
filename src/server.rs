@@ -400,12 +400,9 @@ async fn run_server_inner(
 
                 let call_id = call.call_id;
 
-                // Replicas are read-only: reject reducer calls until promoted.
+                // Relay nodes (replicas) proxy reducer calls to the primary.
                 if crate::replication::is_replica() {
-                    let resp = ReducerResponse::error(
-                        call_id,
-                        "This node is a read-only replica.".to_string(),
-                    );
+                    let resp = crate::replication::relay_reducer_call(&call);
                     if let Err(e) = call.response_tx.send(resp) {
                         log::warn!("[voltra] Response delivery failed: {}", e);
                     }
@@ -698,6 +695,7 @@ async fn run_server_inner(
         inline_registry,
         None,
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        None, // cluster_route — single-node embedded server
     )
     .await
 }

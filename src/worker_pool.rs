@@ -351,11 +351,7 @@ fn lobby_worker_loop(
             let call_id = call.call_id;
 
             if crate::replication::is_replica() {
-                let resp = ReducerResponse::error(
-                    call_id,
-                    "This node is a read-only replica.".to_string(),
-                );
-                let _ = call.response_tx.send(resp);
+                let _ = call.response_tx.send(crate::replication::relay_reducer_call(&call));
                 continue;
             }
 

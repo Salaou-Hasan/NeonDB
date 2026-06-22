@@ -10,8 +10,11 @@
 // hosts a given lobby, then reconnect directly to that region's ws_url.
 
 use std::env;
+use std::sync::Arc;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
+
+use super::ring::SharedRing;
 
 /// A single named region in the cluster.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -103,6 +106,18 @@ impl RegionRegistry {
     pub fn my_region_info(&self) -> Option<ClusterRegion> {
         self.get(&self.my_region)
     }
+
+    /// Build a consistent-hash ring seeded with all known region IDs.
+    /// Use this for deterministic lobby-to-region assignment without manual registration.
+    pub fn build_ring(&self) -> Arc<SharedRing> {
+        let ring = SharedRing::new();
+        for r in self.all() {
+            ring.add_cluster(&r.id);
+        }
+        // Always include this node's own region, even if VOLTRA_REGIONS omits it.
+        ring.add_cluster(&self.my_region);
+        ring
+    }
 }
 
 #[cfg(test)]
@@ -166,5 +181,39 @@ mod tests {
         let r = make_registry("default", "");
         assert!(r.all().is_empty());
         assert!(!r.is_multi_region());
+    }
+
+    #[test]
+    fn build_ring_assigns_all_regions() {
+        let r = make_registry("europe", "europe=ws://eu:3000|http://eu:3001,asia=ws://as:3000|http://as:3001");
+        let ring = r.build_ring();
+        assert_eq!(ring.len(), 2);
+        // Every lobby gets assigned somewhere.
+        for i in 0..50 {
+            let owner = ring.get_cluster(&format!("lobby_{i}"));
+            assert!(owner.is_some(), "lobby_{i} has no owner");
+        }
+    }
+
+    #[test]
+    fn build_ring_assignment_is_deterministic() {
+        let r = make_registry("europe", "europe=ws://eu:3000|http://eu:3001,asia=ws://as:3000|http://as:3001");
+        let ring = r.build_ring();
+        // Same lobby_id must always map to same region on any node.
+        for lobby in &["lobby_1", "lobby_42", "lobby_999"] {
+            let a = ring.get_cluster(lobby);
+            let b = ring.get_cluster(lobby);
+            assert_eq!(a, b, "{lobby} mapping is not deterministic");
+        }
+    }
+
+    #[test]
+    fn build_ring_includes_own_region_when_missing_from_list() {
+        // my_region not in VOLTRA_REGIONS — still added by build_ring().
+        let r = make_registry("na", "europe=ws://eu:3000|http://eu:3001");
+        let ring = r.build_ring();
+        assert_eq!(ring.len(), 2); // europe + na
+        let ids = ring.cluster_ids();
+        assert!(ids.contains(&"na".to_string()));
     }
 }

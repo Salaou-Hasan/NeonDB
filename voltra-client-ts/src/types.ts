@@ -56,6 +56,16 @@ export interface VoltraClientOptions {
    */
   reconnect?: ReconnectOptions;
   /**
+   * HTTP URL of this node's metrics server (e.g. "http://localhost:3001").
+   *
+   * When set, the client queries `GET <metricsUrl>/cluster/topology` before
+   * each reconnect attempt to find the least-loaded healthy node and
+   * automatically updates its connection target.  This implements
+   * cluster-aware reconnect: after a node failure, clients reconnect to
+   * the healthiest available node instead of retrying the dead one.
+   */
+  metricsUrl?: string;
+  /**
    * Called every time the WebSocket closes unexpectedly (before any
    * reconnect attempt is scheduled).
    */

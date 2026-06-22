@@ -30,13 +30,64 @@ use crate::wal::{BatchedWalWriter, WalEntry, WalReader};
 use base64::Engine as _;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 // ── Global role flag ──────────────────────────────────────────────────────────
 
 static IS_REPLICA: AtomicBool = AtomicBool::new(false);
 static REPLICA_LAST_APPLIED_SEQ: AtomicU64 = AtomicU64::new(0);
 static REPLICA_LAG_ENTRIES: AtomicU64 = AtomicU64::new(0);
+/// True when this node has detected its own health degrading and is draining
+/// existing connections before a graceful shutdown/restart.
+/// Set by the health monitor in main.rs; read by /cluster/health.
+static DRAINING: AtomicBool = AtomicBool::new(false);
+// Primary metrics URL — set once when the replica pull loop starts.
+static PRIMARY_URL_CACHE: OnceLock<String> = OnceLock::new();
+
+// ── WAL push bus (primary side) ───────────────────────────────────────────────
+//
+// After each committed WAL batch the primary calls `wal_push_bus().broadcast(batch)`.
+// Relay processes that connect via `GET /replication/wal-push` register a receiver
+// and receive WAL entries as they are committed — zero polling latency.
+//
+// ponytail: tokio broadcast, 64-entry buffer per relay.  Drop-on-lagged is fine:
+//           the relay falls back to `/replication/wal?from_seq=N` for the gap.
+
+use tokio::sync::broadcast;
+
+pub struct WalPushBus {
+    tx: broadcast::Sender<Vec<String>>, // base64(rmp(WalEntry)) per batch
+}
+
+impl WalPushBus {
+    fn new() -> Self {
+        let (tx, _) = broadcast::channel(64);
+        WalPushBus { tx }
+    }
+
+    /// Publish a freshly committed batch to all connected relays.
+    pub fn broadcast(&self, encoded: Vec<String>) {
+        if !encoded.is_empty() {
+            let _ = self.tx.send(encoded);
+        }
+    }
+
+    /// Subscribe a new relay to the push stream.
+    pub fn subscribe(&self) -> broadcast::Receiver<Vec<String>> {
+        self.tx.subscribe()
+    }
+
+    /// Count of currently connected relay listeners.
+    pub fn relay_count(&self) -> usize {
+        self.tx.receiver_count()
+    }
+}
+
+static WAL_PUSH_BUS: OnceLock<WalPushBus> = OnceLock::new();
+
+pub fn wal_push_bus() -> &'static WalPushBus {
+    WAL_PUSH_BUS.get_or_init(WalPushBus::new)
+}
 
 /// True when this node is a read-only replica.  Checked by the reducer worker
 /// loop before executing any write.
@@ -47,6 +98,78 @@ pub fn is_replica() -> bool {
 /// Set the replica flag.  `set_replica(false)` promotes this node to primary.
 pub fn set_replica(replica: bool) {
     IS_REPLICA.store(replica, Ordering::Relaxed);
+}
+
+/// True when this node is in graceful drain mode (health thresholds exceeded).
+/// New client connections should be routed elsewhere by the load balancer.
+pub fn is_draining() -> bool {
+    DRAINING.load(Ordering::Relaxed)
+}
+
+/// Set/clear the drain flag.  Called by the health monitor in main.rs.
+pub fn set_draining(draining: bool) {
+    DRAINING.store(draining, Ordering::Relaxed);
+    if draining {
+        log::warn!("[health] Node entering DRAIN mode — health thresholds exceeded. Route new connections elsewhere.");
+    } else {
+        log::info!("[health] Node leaving drain mode — health recovered.");
+    }
+}
+
+/// Metrics URL of the primary node this replica pulls from.
+/// Set on first call to `run_replica_loop`; used by worker threads to proxy
+/// reducer calls transparently instead of rejecting them.
+pub fn primary_url() -> Option<&'static str> {
+    PRIMARY_URL_CACHE.get().map(String::as_str)
+}
+
+/// Forward a reducer call to the primary and return its `ReducerResponse`.
+///
+/// Called whenever `is_replica()` is true and a reducer call arrives.  Replicas
+/// become transparent relay nodes — the client sees a normal success/error reply
+/// with its original call_id.  Latency added = 1 intra-AZ HTTP round-trip.
+pub fn relay_reducer_call(call: &crate::network::PendingCall) -> crate::network::ReducerResponse {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    use crate::cluster::proxy::{ProxyCallRequest, ProxyCallResponse};
+    use crate::network::ReducerResponse;
+
+    let Some(purl) = primary_url() else {
+        return ReducerResponse::error(call.call_id, "relay: no primary configured (set VOLTRA_PRIMARY_URL)".into());
+    };
+
+    static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+    let client = CLIENT.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap_or_default()
+    });
+
+    let url = format!("{}/cluster/call", purl.trim_end_matches('/'));
+    let req = ProxyCallRequest {
+        reducer_name: call.reducer_name.clone(),
+        args_b64: B64.encode(&call.args),
+        caller_id: call.caller_id.clone(),
+        caller_role: call.caller_role.clone(),
+        target_shard_id: None,
+    };
+
+    match client.post(&url).json(&req).send() {
+        Err(e) => ReducerResponse::error(call.call_id, format!("relay: primary unreachable: {e}")),
+        Ok(resp) => match resp.json::<ProxyCallResponse>() {
+            Err(e) => ReducerResponse::error(call.call_id, format!("relay: bad response: {e}")),
+            Ok(pr) if !pr.ok => ReducerResponse::error(
+                call.call_id,
+                pr.error.unwrap_or_else(|| "primary rejected call".into()),
+            ),
+            Ok(pr) => {
+                let bytes = pr.result_b64
+                    .and_then(|s| B64.decode(&s).ok())
+                    .unwrap_or_default();
+                ReducerResponse::success(call.call_id, bytes)
+            }
+        },
+    }
 }
 
 /// Last WAL sequence number applied from the primary (replica only).
@@ -190,6 +313,8 @@ pub async fn run_replica_loop(
 ) {
     let client = reqwest::Client::new();
     let base = primary_url.trim_end_matches('/').to_string();
+    // Cache for worker threads so they can proxy reducer calls to this primary.
+    let _ = PRIMARY_URL_CACHE.set(base.clone());
     let miss_limit = failover_miss_count.max(1);
     log::info!("[replication] replica mode: pulling from {} every {}ms", base, poll_ms);
     if auto_failover {

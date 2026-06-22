@@ -3553,6 +3553,56 @@ async fn run_server(config: Config) -> Result<()> {
         }
     } else { log::info!("WAL does not exist, starting fresh"); }
 
+    // ── Auto-rejoin: catch up WAL gap from any reachable peer ─────────────────
+    // When VOLTRA_AUTO_REJOIN=1 and VOLTRA_PEERS is configured, this node
+    // queries peers on startup to see if its WAL is stale. If behind, it pulls
+    // and applies the gap before opening the WebSocket listener so clients never
+    // see stale data after a crash+restart.
+    if std::env::var("VOLTRA_AUTO_REJOIN").map(|v| v == "1" || v == "true").unwrap_or(false) {
+        let peers_raw = std::env::var("VOLTRA_PEERS").unwrap_or_default();
+        if !peers_raw.is_empty() {
+            let my_seq = initial_seq.saturating_sub(1); // last applied seq
+            log::info!("[rejoin] Checking WAL gap (local seq={})…", my_seq);
+            // Try each peer until one responds.
+            'peer_loop: for part in peers_raw.split(',') {
+                let metrics_url = part.trim().splitn(2, '=').last().unwrap_or("").trim_end_matches('/');
+                if metrics_url.is_empty() { continue; }
+                let url = format!("{}/replication/wal?from_seq={}&max=10000", metrics_url, my_seq);
+                match reqwest::blocking::get(&url) {
+                    Ok(resp) if resp.status().is_success() => {
+                        match resp.json::<serde_json::Value>() {
+                            Ok(body) => {
+                                let encoded: Vec<String> = body["entries"]
+                                    .as_array()
+                                    .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                                    .unwrap_or_default();
+                                if encoded.is_empty() {
+                                    log::info!("[rejoin] WAL is current — no gap");
+                                    break 'peer_loop;
+                                }
+                                let entries = voltra::replication::decode_entries(&encoded);
+                                let wal_writer_tmp = Arc::new(BatchedWalWriter::open(
+                                    &config.wal_path, config.fsync_interval_ms,
+                                    config.wal_batch_size, config.unsafe_no_fsync,
+                                ).unwrap_or_else(|e| panic!("WAL open failed: {}", e)));
+                                let global_seq_tmp = Arc::new(std::sync::atomic::AtomicU64::new(initial_seq));
+                                let subs_tmp = Arc::new(SubscriptionManager::new());
+                                let n = voltra::replication::apply_replicated_entries(
+                                    &entries, &tables, &subs_tmp, &wal_writer_tmp, &global_seq_tmp,
+                                );
+                                initial_seq = global_seq_tmp.load(std::sync::atomic::Ordering::Relaxed);
+                                log::info!("[rejoin] Applied {} WAL entries from {} — caught up to seq={}", n, metrics_url, initial_seq);
+                            }
+                            Err(e) => log::warn!("[rejoin] Could not parse WAL response from {}: {}", metrics_url, e),
+                        }
+                        break 'peer_loop;
+                    }
+                    _ => log::debug!("[rejoin] Peer {} unreachable, trying next", metrics_url),
+                }
+            }
+        }
+    }
+
     let migrations_dir = PathBuf::from("migrations");
     match voltra::migrations::apply_migrations(&migrations_dir, &tables) {
         Ok(0) => {}
@@ -3754,6 +3804,34 @@ async fn run_server(config: Config) -> Result<()> {
         ))
     };
 
+    // ── Region registry + lobby routes ──────────────────────────────────────────
+    // Built here (before listener_handle) so the WS handler can proxy reducer
+    // calls to the correct region without the client needing to reconnect.
+    if !config.region.is_empty() && config.region != "default" {
+        std::env::set_var("VOLTRA_REGION", &config.region);
+    }
+    if !config.regions.is_empty() {
+        std::env::set_var("VOLTRA_REGIONS", &config.regions);
+    }
+    let region_registry = Arc::new(voltra::cluster::RegionRegistry::from_env());
+    if region_registry.is_multi_region() {
+        log::info!("[regions] Multi-region mode: region='{}', peers={}",
+            region_registry.my_region, region_registry.peer_regions().len());
+    }
+    let lobby_routes = voltra::cluster::LobbyRouteRegistry::new(tables.clone());
+    let lobby_ring   = region_registry.build_ring();
+
+    let ws_cluster_route: Option<Arc<voltra::network::ClusterRouteCtx>> =
+        if region_registry.is_multi_region() {
+            Some(Arc::new(voltra::network::ClusterRouteCtx {
+                lobby_routes:    lobby_routes.clone(),
+                region_registry: region_registry.clone(),
+                cluster_secret:  cluster_bus.config.cluster_secret.clone(),
+            }))
+        } else {
+            None
+        };
+
     let listener_handle = {
         let config_c = config.clone(); let tx_c = reducer_tx.clone();
         let subs_c = subscription_manager.clone(); let tables_c = tables.clone();
@@ -3770,13 +3848,14 @@ async fn run_server(config: Config) -> Result<()> {
         let inl_c = inline_registry.clone();
         let lr_c = lobby_router.clone();
         let df_c = drain_flag.clone();
+        let cr_c = ws_cluster_route.clone();
         tokio::spawn(async move {
             if let Err(e) = start_listener(
                 config_c.host, config_c.port, tx_c, subs_c, tables_c,
                 config_c.max_connections, config_c.api_key.clone(),
                 conns_c, perms_c, config_c.sql_timeout_ms,
                 auth_c, rl_c, pres_c, ttl_c, iss_c, rx_shutdown, metrics_c, tls_cfg,
-                tenant_registry_ws, inl_c, Some(lr_c), df_c,
+                tenant_registry_ws, inl_c, Some(lr_c), df_c, cr_c,
             ).await { log::error!("Listener error: {}", e); }
         })
     };
@@ -3800,23 +3879,7 @@ async fn run_server(config: Config) -> Result<()> {
         let issuer_c = identity_issuer.clone();
         let qprobe_c = queue_probe.clone();
 
-        // ── Multi-region infrastructure ──────────────────────────────────────
-        // Override VOLTRA_REGION / VOLTRA_REGIONS via config fields so the
-        // same env-var-based construction works whether started from binary
-        // or from run_server().
-        if !config.region.is_empty() && config.region != "default" {
-            std::env::set_var("VOLTRA_REGION", &config.region);
-        }
-        if !config.regions.is_empty() {
-            std::env::set_var("VOLTRA_REGIONS", &config.regions);
-        }
-        let region_registry = Arc::new(voltra::cluster::RegionRegistry::from_env());
-        if region_registry.is_multi_region() {
-            log::info!("[regions] Multi-region mode: region='{}', peers={}",
-                region_registry.my_region, region_registry.peer_regions().len());
-        }
-
-        let lobby_routes = voltra::cluster::LobbyRouteRegistry::new(tables.clone());
+        // region_registry, lobby_routes, lobby_ring built before listener_handle (outer scope).
 
         let leaderboard = Arc::new(voltra::leaderboard::LeaderboardEngine::new());
         // Register the default leaderboard board.
@@ -3849,6 +3912,7 @@ async fn run_server(config: Config) -> Result<()> {
             tenant_registry: tenant_registry.clone(),
             cluster_bus: cluster_bus.clone(),
             drain_flag: drain_flag.clone(),
+            ws_port: config.port,
             active_connections: active_connections.clone(),
             region_registry: region_registry.clone(),
             lobby_routes: lobby_routes.clone(),
@@ -3857,6 +3921,7 @@ async fn run_server(config: Config) -> Result<()> {
             lobby_router: lobby_router.clone(),
             persistent: persistent_store.clone(),
             auth_service: auth_service.clone(),
+            lobby_ring: lobby_ring.clone(),
         });
         let schema_c = schema_registry.clone();
         tokio::spawn(async move {
@@ -3889,7 +3954,7 @@ async fn run_server(config: Config) -> Result<()> {
                         auto_failover, miss_count, shut_r,
                     ).await;
                 });
-                log::info!("[replication] Started in REPLICA mode (read-only)");
+                log::info!("[replication] Started in RELAY mode (reads local, writes proxied to primary)");
             }
             None => {
                 log::error!(
@@ -3943,6 +4008,40 @@ async fn run_server(config: Config) -> Result<()> {
     voltra::cluster::gossip::start_gossip(cluster_bus.clone(), shutdown_rx.clone());
     voltra::cluster::fanout::start_fanout_retry(cluster_bus.clone(), shutdown_rx.clone());
 
+    // ── Predictive health monitor ─────────────────────────────────────────────
+    // Watches queue depth and active connections every 5s.
+    // When either exceeds 90% of capacity, enters drain mode so the load
+    // balancer stops routing new connections here before the node degrades.
+    {
+        let qmon = queue_probe.clone();
+        let cmon = active_connections.clone();
+        let dfmon = drain_flag.clone();
+        let cap   = config.reducer_queue_cap as f64;
+        let max_c = config.max_connections as f64;
+        let mut shut_h = shutdown_rx.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {}
+                    _ = shut_h.changed() => break,
+                }
+                let q_pct = qmon.len() as f64 / cap.max(1.0);
+                let c_pct = cmon.load(std::sync::atomic::Ordering::Relaxed) as f64 / max_c.max(1.0);
+                let mem_pct = get_memory_usage_bytes() as f64 / (4 * 1024 * 1024 * 1024u64) as f64; // 4GB cap
+                let pressure = q_pct.max(c_pct).max(mem_pct);
+                let was_draining = dfmon.load(std::sync::atomic::Ordering::Relaxed)
+                    || voltra::replication::is_draining();
+                if pressure > 0.90 && !was_draining {
+                    voltra::replication::set_draining(true);
+                } else if pressure < 0.70 && voltra::replication::is_draining() {
+                    voltra::replication::set_draining(false);
+                }
+            }
+        });
+    }
+
     // Guards against overlapping snapshot tasks: save_snapshot() clones every
     // row into memory before serializing. If a snapshot takes longer than the
     // interval between triggers, a second snapshot would start before the first
@@ -3972,13 +4071,13 @@ async fn run_server(config: Config) -> Result<()> {
                 };
                 let call_id     = call.call_id;
 
-                // Replicas are read-only: reject reducer calls until promoted.
+                // Relay nodes (replicas) proxy reducer calls to the primary.
+                // relay_reducer_call uses reqwest::blocking — must not block an async task.
                 if voltra::replication::is_replica() {
-                    let resp = ReducerResponse::error(
-                        call_id,
-                        "This node is a read-only replica. Write to the primary, or promote this node via POST /replication/promote.".to_string(),
-                    );
-                    if let Err(e) = call.response_tx.send(resp) { log::warn!("send response: {}", e); }
+                    tokio::task::spawn_blocking(move || {
+                        let resp = voltra::replication::relay_reducer_call(&call);
+                        let _ = call.response_tx.send(resp);
+                    });
                     continue;
                 }
 
@@ -4072,6 +4171,9 @@ async fn run_server(config: Config) -> Result<()> {
                                 log::warn!("WAL append failed: {}", e);
                             } else {
                                 metrics_w.wal_entries_written_total.inc();
+                                // Push to connected relays immediately (zero-poll delivery).
+                                voltra::replication::wal_push_bus()
+                                    .broadcast(voltra::replication::encode_entries(&[entry]));
                             }
                             // Periodic snapshot + WAL rotation. Skip if a snapshot is
                             // already in flight — overlapping snapshots each clone the
@@ -4402,6 +4504,9 @@ struct AdminState {
     tenant_registry: Arc<voltra::tenant::TenantRegistry>,
     cluster_bus: Arc<voltra::cluster::ClusterBus>,
     drain_flag: Arc<std::sync::atomic::AtomicBool>,
+    /// WebSocket port — included in /cluster/health and /cluster/topology so
+    /// peers and clients know where to connect.
+    ws_port: u16,
     active_connections: Arc<std::sync::atomic::AtomicUsize>,
     region_registry: Arc<voltra::cluster::RegionRegistry>,
     lobby_routes: Arc<voltra::cluster::LobbyRouteRegistry>,
@@ -4413,6 +4518,8 @@ struct AdminState {
     persistent: Arc<voltra::persistent::PersistentStore>,
     /// Authentication service (register / login / verify token).
     auth_service: Arc<voltra::auth_service::AuthService>,
+    /// Consistent-hash ring over region IDs — used for auto-assigning lobbies.
+    lobby_ring: Arc<voltra::cluster::SharedRing>,
 }
 
 async fn start_metrics_server(
@@ -4884,6 +4991,47 @@ async fn handle_metrics_request(
             }
         }
 
+        // GET /replication/wal-push — relay connects here for push-based WAL delivery.
+        //
+        // Returns a newline-delimited JSON stream.  Each line is either:
+        //   { "entries": [...], "last_seq": N }  — a committed batch
+        //   { "lagged": N }                       — relay missed N batches; re-poll from /replication/wal
+        //
+        // The connection stays open until the relay disconnects.  Primary sends each
+        // committed WAL batch within microseconds of the commit, eliminating poll lag.
+        (&Method::GET, "/replication/wal-push") => {
+            let mut rx = voltra::replication::wal_push_bus().subscribe();
+            let (mut sender, body) = Body::channel();
+            tokio::spawn(async move {
+                use tokio::sync::broadcast::error::RecvError;
+                loop {
+                    match rx.recv().await {
+                        Ok(entries) => {
+                            let line = format!("{}\n", serde_json::json!({
+                                "entries": entries
+                            }));
+                            if sender.send_data(bytes::Bytes::from(line)).await.is_err() {
+                                break; // relay disconnected
+                            }
+                        }
+                        Err(RecvError::Lagged(n)) => {
+                            let line = format!("{}\n", serde_json::json!({ "lagged": n }));
+                            if sender.send_data(bytes::Bytes::from(line)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(RecvError::Closed) => break,
+                    }
+                }
+            });
+            let mut resp = Response::new(body);
+            resp.headers_mut().insert(
+                hyper::header::CONTENT_TYPE,
+                hyper::header::HeaderValue::from_static("application/x-ndjson"),
+            );
+            Ok(resp)
+        }
+
         (&Method::GET, "/replication/status") => {
             Ok(json_response(voltra::replication::status_json()))
         }
@@ -4909,10 +5057,53 @@ async fn handle_metrics_request(
         // POST /cluster/call    — execute a proxied reducer call
         // POST /cluster/join    — register a new peer dynamically
         (&Method::GET, "/cluster/health") => {
+            let conns = admin.active_connections.load(std::sync::atomic::Ordering::Relaxed);
+            let draining = admin.drain_flag.load(std::sync::atomic::Ordering::Relaxed)
+                || voltra::replication::is_draining();
             Ok(json_response(serde_json::json!({
                 "ok": true,
                 "shard_id": admin.cluster_bus.config.my_shard_id,
+                "draining": draining,
+                "connections": conns,
+                "queue_depth": queue_probe.len(),
+                "memory_bytes": get_memory_usage_bytes(),
+                "ws_url": format!("ws://{}:{}", "0.0.0.0", admin.ws_port),
             })))
+        }
+
+        (&Method::GET, "/cluster/topology") => {
+            // Self entry.
+            let conns = admin.active_connections.load(std::sync::atomic::Ordering::Relaxed);
+            let draining = admin.drain_flag.load(std::sync::atomic::Ordering::Relaxed)
+                || voltra::replication::is_draining();
+            let mut nodes = vec![serde_json::json!({
+                "shard_id": admin.cluster_bus.config.my_shard_id,
+                "ws_url": format!("ws://{}:{}", "0.0.0.0", admin.ws_port),
+                "healthy": true,
+                "draining": draining,
+                "connections": conns,
+                "queue_depth": queue_probe.len(),
+                "memory_bytes": get_memory_usage_bytes(),
+                "phi": 0.0,
+                "my_node": true,
+            })];
+            // Peer entries (from gossip state).
+            for entry in admin.cluster_bus.peers.iter() {
+                let peer = entry.value();
+                let cached_ws = peer.ws_url.lock().ok()
+                    .and_then(|g| g.clone())
+                    .unwrap_or_default();
+                nodes.push(serde_json::json!({
+                    "shard_id": *entry.key(),
+                    "metrics_url": peer.node.metrics_url,
+                    "ws_url": cached_ws,
+                    "healthy": peer.is_healthy(),
+                    "draining": peer.draining.load(std::sync::atomic::Ordering::Relaxed),
+                    "phi": peer.phi(),
+                    "my_node": false,
+                }));
+            }
+            Ok(json_response(serde_json::json!({ "nodes": nodes })))
         }
 
         (&Method::GET, "/cluster/peers") => {
@@ -5051,15 +5242,20 @@ async fn handle_metrics_request(
                     "ws_url":    route.ws_url,
                 }))),
                 None => {
-                    // Unknown lobby — assume it lives here (single-region fallback).
+                    // No explicit registration — use the ring to deterministically
+                    // assign the lobby to a region, then cache it for future lookups.
+                    let region_id = admin.lobby_ring
+                        .get_cluster(lobby_id)
+                        .unwrap_or_else(|| admin.region_registry.my_region.clone());
                     let ws_url = admin.region_registry
-                        .ws_url_for(&admin.region_registry.my_region)
+                        .ws_url_for(&region_id)
                         .unwrap_or_default();
+                    admin.lobby_routes.register(lobby_id, &region_id, &ws_url);
                     Ok(json_response(serde_json::json!({
-                        "lobby_id":  lobby_id,
-                        "region_id": admin.region_registry.my_region,
-                        "ws_url":    ws_url,
-                        "fallback":  true,
+                        "lobby_id":    lobby_id,
+                        "region_id":   region_id,
+                        "ws_url":      ws_url,
+                        "auto_assigned": true,
                     })))
                 }
             }

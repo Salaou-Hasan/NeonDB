@@ -126,6 +126,7 @@ struct AcceptState {
     lobby_router:         Option<Arc<crate::worker_pool::LobbyRouter>>,
     drain_flag:           Arc<AtomicBool>,
     max_connections:      usize,
+    cluster_route:        Option<Arc<ClusterRouteCtx>>,
 }
 
 async fn run_accept_loop(
@@ -176,6 +177,7 @@ async fn run_accept_loop(
                         let ten     = s.tenant_registry.clone();
                         let inl     = s.inline_registry.clone();
                         let lr      = s.lobby_router.clone();
+                        let cr      = s.cluster_route.clone();
 
                         s.metrics.websocket_connects_total.inc();
                         s.metrics.websocket_connections_active.inc();
@@ -186,7 +188,7 @@ async fn run_accept_loop(
                                     Ok(tls_stream) => {
                                         if let Err(e) = handle_client(
                                             tls_stream, tx, subs, tbl, api_key, conns, perms,
-                                            sql_to, auth_v, rl, pres, ttl, iss, peer, sd, met, ten, inl, lr,
+                                            sql_to, auth_v, rl, pres, ttl, iss, peer, sd, met, ten, inl, lr, cr,
                                         ).await { log::warn!("TLS client error: {}", e); }
                                     }
                                     Err(e) => log::warn!("TLS accept error from {}: {}", peer, e),
@@ -194,7 +196,7 @@ async fn run_accept_loop(
                             } else {
                                 if let Err(e) = handle_client(
                                     stream, tx, subs, tbl, api_key, conns, perms,
-                                    sql_to, auth_v, rl, pres, ttl, iss, peer, sd, met, ten, inl, lr,
+                                    sql_to, auth_v, rl, pres, ttl, iss, peer, sd, met, ten, inl, lr, cr,
                                 ).await { log::warn!("Client error: {}", e); }
                             }
                         });
@@ -208,6 +210,15 @@ async fn run_accept_loop(
             }
         }
     }
+}
+
+/// Context for transparent cross-node lobby routing.
+/// When `Some` on a node that knows about peer regions, reducer calls for
+/// lobbies owned by another region are proxied automatically.
+pub struct ClusterRouteCtx {
+    pub lobby_routes:    Arc<crate::cluster::LobbyRouteRegistry>,
+    pub region_registry: Arc<crate::cluster::RegionRegistry>,
+    pub cluster_secret:  Option<String>,
 }
 
 /// A pending reducer call with response channel.
@@ -311,6 +322,7 @@ pub async fn start_listener(
     inline_registry: Arc<InlineRegistry>,
     lobby_router: Option<Arc<crate::worker_pool::LobbyRouter>>,
     drain_flag: Arc<AtomicBool>,
+    cluster_route: Option<Arc<ClusterRouteCtx>>,
 ) -> Result<()> {
     let bind_addr = format!("{}:{}", addr, port);
     let tls_acceptor: Option<TlsAcceptor> = tls.map(TlsAcceptor::from);
@@ -346,6 +358,7 @@ pub async fn start_listener(
         lobby_router,
         drain_flag,
         max_connections,
+        cluster_route,
     });
 
     let mut handles = Vec::with_capacity(listeners.len());
@@ -383,6 +396,7 @@ async fn handle_client<S>(
     tenant_registry: Arc<TenantRegistry>,
     inline_registry: Arc<InlineRegistry>,
     lobby_router: Option<Arc<crate::worker_pool::LobbyRouter>>,
+    cluster_route: Option<Arc<ClusterRouteCtx>>,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -739,6 +753,58 @@ where
 
                         // Extract lobby hint from first arg (e.g. "l42_p123" → "42").
                         let lobby_hint = extract_lobby_hint(&call.args);
+
+                        // ── Cross-node proxy ──────────────────────────────────
+                        // If the lobby lives on a different region, forward the
+                        // call there and relay the response to this client.
+                        if let (Some(ctx), Some(hint)) = (&cluster_route, &lobby_hint) {
+                            if let Some(route) = ctx.lobby_routes.lookup(hint) {
+                                if route.region_id != ctx.region_registry.my_region {
+                                    if let Some(murl) = ctx.region_registry.metrics_url_for(&route.region_id) {
+                                        let secret  = ctx.cluster_secret.clone();
+                                        let reducer = call.reducer_name.clone();
+                                        let args    = call.args.clone();
+                                        let cid     = caller_id.clone();
+                                        let crole   = caller_role.clone();
+                                        let rsp_tx  = response_tx.clone();
+                                        let url     = format!("{murl}/cluster/call");
+                                        tokio::task::spawn_blocking(move || {
+                                            use crate::cluster::proxy::{ProxyCallRequest, ProxyCallResponse};
+                                            use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+                                            let body = serde_json::to_vec(&ProxyCallRequest {
+                                                reducer_name: reducer,
+                                                args_b64: B64.encode(&args),
+                                                caller_id: cid,
+                                                caller_role: crole,
+                                                target_shard_id: None,
+                                            }).unwrap_or_default();
+                                            let client = crate::cluster::global_http_client(2000);
+                                            let mut req = client.post(&url)
+                                                .header("Content-Type", "application/json")
+                                                .body(body);
+                                            if let Some(s) = secret {
+                                                req = req.header("x-voltra-cluster-secret", s);
+                                            }
+                                            let resp = match req.send().and_then(|r| r.json::<ProxyCallResponse>()) {
+                                                Ok(r) if r.ok => {
+                                                    let bytes = r.result_b64
+                                                        .and_then(|b| B64.decode(&b).ok())
+                                                        .unwrap_or_default();
+                                                    ReducerResponse::success(call_id, bytes)
+                                                }
+                                                Ok(r) => ReducerResponse::error(call_id, r.error.unwrap_or_else(|| "proxy error".into())),
+                                                Err(e) => ReducerResponse::error(call_id, format!("proxy unreachable: {e}")),
+                                            };
+                                            let _ = rsp_tx.send(resp);
+                                        });
+                                        metrics.reducer_calls_total.inc();
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                        // ── end cross-node proxy ──────────────────────────────
+
                         let pending = PendingCall {
                             call_id,
                             reducer_name: call.reducer_name,

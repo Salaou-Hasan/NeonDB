@@ -62,6 +62,17 @@ async fn ping_all_peers(bus: &Arc<ClusterBus>) {
             }
             match req.send() {
                 Ok(resp) if resp.status().is_success() => {
+                    // Parse health response for draining status + ws_url.
+                    let body: serde_json::Value = resp.json().unwrap_or_default();
+                    if let Some(entry) = bus_c.peers.get(&shard_id) {
+                        let draining = body["draining"].as_bool().unwrap_or(false);
+                        entry.draining.store(draining, std::sync::atomic::Ordering::Relaxed);
+                        if let Some(ws) = body["ws_url"].as_str() {
+                            if let Ok(mut g) = entry.ws_url.lock() {
+                                *g = Some(ws.to_owned());
+                            }
+                        }
+                    }
                     bus_c.mark_healthy(shard_id);
                     log::debug!("[cluster/gossip] shard{} OK ({})", shard_id, node.metrics_url);
                 }

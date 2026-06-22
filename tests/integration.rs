@@ -766,3 +766,69 @@ async fn integration_permissions_open_reducer_always_allowed() {
     let _ = child.wait();
     let _ = std::fs::remove_file(&wal_path);
 }
+
+/// Relay integration test: a replica node proxies reducer calls to the primary.
+///
+/// Topology:
+///   primary  ws=18094  metrics=19094
+///   relay    ws=18095  metrics=19095  (VOLTRA_ROLE=replica, PRIMARY=http://127.0.0.1:19094)
+///
+/// Client connects to the relay and calls `increment` — the relay transparently
+/// forwards the call to the primary and returns the result.
+#[tokio::test]
+async fn integration_relay_proxies_reducer_to_primary() {
+    let primary_ws  = 18094u16;
+    let primary_met = 19094u16;
+    let relay_ws    = 18095u16;
+
+    let primary_wal = std::env::temp_dir().join("voltra_relay_primary.wal");
+    let relay_wal   = std::env::temp_dir().join("voltra_relay_replica.wal");
+    let _ = std::fs::remove_file(&primary_wal);
+    let _ = std::fs::remove_file(&relay_wal);
+
+    // Start primary.
+    let mut primary = spawn_server_with_env(
+        primary_ws,
+        primary_wal.clone(),
+        &[("VOLTRA_METRICS_PORT", &primary_met.to_string())],
+    );
+
+    let primary_ws_url = format!("ws://127.0.0.1:{}", primary_ws);
+    wait_for_server_ready(&primary_ws_url, Duration::from_secs(5)).await;
+
+    // Start relay (replica mode — proxies writes to primary, reads from local state).
+    let primary_url = format!("http://127.0.0.1:{}", primary_met);
+    let mut relay = spawn_server_with_env(
+        relay_ws,
+        relay_wal.clone(),
+        &[
+            ("VOLTRA_ROLE",            "replica"),
+            ("VOLTRA_PRIMARY_URL",     &primary_url),
+            ("VOLTRA_REPLICA_POLL_MS", "50"),
+        ],
+    );
+
+    let relay_ws_url = format!("ws://127.0.0.1:{}", relay_ws);
+    wait_for_server_ready(&relay_ws_url, Duration::from_secs(5)).await;
+
+    // Client connects to the RELAY — not the primary.
+    let (mut ws, _) = tokio_tungstenite::connect_async(&relay_ws_url)
+        .await
+        .expect("connect to relay");
+
+    let args = rmp_serde::to_vec(&IncrementArgs { name: "relay_test".into(), delta: 7 }).unwrap();
+    let resp = send_call(&mut ws, 1, "increment", args).await;
+
+    assert!(
+        resp.success,
+        "Reducer proxied through relay must succeed; error: {:?}",
+        resp.error
+    );
+
+    primary.kill().ok();
+    relay.kill().ok();
+    let _ = primary.wait();
+    let _ = relay.wait();
+    let _ = std::fs::remove_file(&primary_wal);
+    let _ = std::fs::remove_file(&relay_wal);
+}

@@ -103,11 +103,25 @@ impl Default for PeerHealth {
 pub struct PeerEntry {
     pub node: NodeInfo,
     health: std::sync::Mutex<PeerHealth>,
+    // Phi Accrual: ring buffer of heartbeat arrival times (last 64).
+    // phi = elapsed_since_last / mean_interval * log10(e)
+    // phi > 8  → suspect;  phi > 12 → dead
+    arrivals: std::sync::Mutex<std::collections::VecDeque<Instant>>,
+    // Set when the peer reported `"draining": true` in a health response.
+    pub draining: std::sync::atomic::AtomicBool,
+    // Most-recently cached ws_url from the peer's health response.
+    pub ws_url: std::sync::Mutex<Option<String>>,
 }
 
 impl PeerEntry {
     pub fn new(node: NodeInfo) -> Self {
-        Self { node, health: std::sync::Mutex::new(PeerHealth::default()) }
+        Self {
+            node,
+            health: std::sync::Mutex::new(PeerHealth::default()),
+            arrivals: std::sync::Mutex::new(std::collections::VecDeque::with_capacity(64)),
+            draining: std::sync::atomic::AtomicBool::new(false),
+            ws_url: std::sync::Mutex::new(None),
+        }
     }
 
     pub fn is_healthy(&self) -> bool {
@@ -120,6 +134,13 @@ impl PeerEntry {
             h.last_seen = Some(Instant::now());
             h.consecutive_failures = 0;
         }
+        // Record this heartbeat arrival for phi computation.
+        if let Ok(mut arr) = self.arrivals.lock() {
+            arr.push_back(Instant::now());
+            while arr.len() > 64 {
+                arr.pop_front();
+            }
+        }
     }
 
     fn mark_failure(&self) -> bool {
@@ -131,6 +152,25 @@ impl PeerEntry {
             return !h.healthy;
         }
         false
+    }
+
+    /// Phi Accrual score for this peer.
+    ///
+    /// phi = (time_since_last_heartbeat / mean_interval) × log10(e)
+    ///
+    /// phi < 1  → healthy (within one mean interval);
+    /// phi > 8  → suspect (18× mean without a heartbeat);
+    /// phi > 12 → almost certainly dead.
+    pub fn phi(&self) -> f64 {
+        let arr = match self.arrivals.lock() { Ok(a) => a, Err(_) => return 0.0 };
+        if arr.len() < 2 { return 0.0; }
+        let instants: Vec<Instant> = arr.iter().copied().collect();
+        let intervals: Vec<f64> = instants.windows(2)
+            .map(|w| (w[1] - w[0]).as_secs_f64())
+            .collect();
+        let mean = intervals.iter().sum::<f64>() / intervals.len() as f64;
+        let elapsed = arr.back().unwrap().elapsed().as_secs_f64();
+        (elapsed / mean.max(0.001)) * std::f64::consts::LOG10_E
     }
 }
 
@@ -153,7 +193,7 @@ impl ClusterConfig {
     pub fn from_env(my_shard_id: u32, shard_count: u32) -> Self {
         let cluster_secret = env::var("VOLTRA_CLUSTER_SECRET").ok();
         let gossip_interval_ms = env::var("VOLTRA_GOSSIP_INTERVAL_MS")
-            .ok().and_then(|v| v.parse().ok()).unwrap_or(5_000);
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(1_000);
         let http_timeout_ms = env::var("VOLTRA_CLUSTER_HTTP_TIMEOUT_MS")
             .ok().and_then(|v| v.parse().ok()).unwrap_or(2_000);
 

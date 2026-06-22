@@ -178,6 +178,7 @@ export class VoltraClient {
       reconnectInterval: 3_000,
       callTimeout: 5_000,
       apiKey: "",
+      metricsUrl: undefined,
       reconnect: undefined as unknown as ReconnectOptions,
       onDisconnect: undefined as unknown as () => void,
       onReconnect: undefined as unknown as (attempt: number) => void,
@@ -596,12 +597,48 @@ export class VoltraClient {
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
       if (!this.closed) {
-        void this.openSocket().catch(() => {
-          // openSocket will have called scheduleReconnect via the onclose handler
-          // if the connection attempt itself failed.
+        // Cluster-aware: pick the least-loaded healthy node before reconnecting.
+        void this.pickBestNode().then(() => {
+          if (!this.closed) {
+            void this.openSocket().catch(() => {
+              // openSocket calls scheduleReconnect via the onclose handler on failure.
+            });
+          }
         });
       }
     }, delay);
+  }
+
+  /**
+   * Query /cluster/topology from the configured metricsUrl and update
+   * this.opts.url to the healthy node with the fewest active connections.
+   *
+   * No-op when metricsUrl is not configured or the request fails — the
+   * client simply retries the same URL as before.
+   */
+  private async pickBestNode(): Promise<void> {
+    const metricsUrl = this.opts.metricsUrl;
+    if (!metricsUrl) return;
+    try {
+      const resp = await fetch(`${metricsUrl}/cluster/topology`);
+      if (!resp.ok) return;
+      const data = (await resp.json()) as {
+        nodes?: Array<{
+          healthy: boolean;
+          draining: boolean;
+          connections: number;
+          ws_url?: string;
+        }>;
+      };
+      const best = (data.nodes ?? [])
+        .filter((n) => n.healthy && !n.draining && n.ws_url)
+        .sort((a, b) => a.connections - b.connections)[0];
+      if (best?.ws_url) {
+        this.opts.url = best.ws_url;
+      }
+    } catch {
+      // Network error — keep current URL and let the reconnect proceed.
+    }
   }
 
   /**
